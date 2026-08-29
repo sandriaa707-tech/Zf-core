@@ -40,7 +40,7 @@ if 'candle_data' not in st.session_state:
 data_lock = threading.Lock()
 
 # ============================================================
-# FUNGSI COUNTDOWN (SISA WAKTU CANDLE) - BASIS UTC
+# FUNGSI COUNTDOWN (SISA WaktU CANDLE) - BASIS UTC
 # ============================================================
 def get_candle_countdown(tf):
     now = datetime.datetime.utcnow()
@@ -67,7 +67,7 @@ def get_candle_countdown(tf):
     except: return "N/A"
 
 # ============================================================
-# INSIALISASI HISTORI (REST API OKX)
+# INISIALISASI HISTORI (REST API OKX)
 # ============================================================
 def fetch_initial_candles():
   for symbol in PAIRS:
@@ -114,12 +114,12 @@ def calculate_zf(closes, volumes):
 # TAMPILAN UTAMA WEB (DASHBOARD)
 # ============================================================
 st.title("⚡ ZUHRI FORMALISM V16.6 | OMNI WEB DASHBOARD")
-st.markdown("Command Center Deterministic Protocol — Pemantauan Multi-Timeframe Resonansi Pasar.")
+st.markdown("Command Center Deterministic Protocol — Pemantauan Multi-Timeframe Berbasis Resonansi Pasar.")
 
 col_c1, col_c2, col_c3 = st.columns(3)
-col_c1.metric("T-Close (1D)", get_candle_countdown("1D"))
-col_c2.metric("T-Close (1W)", get_candle_countdown("1W"))
-col_c3.metric("T-Close (1M)", get_candle_countdown("1M"))
+col_c1.metric("T-Close (1D - Harian)", get_candle_countdown("1D"))
+col_c2.metric("T-Close (1W - Mingguan)", get_candle_countdown("1W"))
+col_c3.metric("T-Close (1M - Bulanan)", get_candle_countdown("1M"))
 
 st.markdown("---")
 st.subheader("Matriks Pemantauan Pasar (Real-Time)")
@@ -147,8 +147,9 @@ with data_lock:
 
 st.table(table_data)
 
-if st.button("🔄 Refresh Data"):
+if st.button("🔄 Refresh Data Manual"):
     st.rerun()
 
+# Auto-refresh otomatis setiap 5 detik tanpa klik manual
 time.sleep(5)
 st.rerun()
