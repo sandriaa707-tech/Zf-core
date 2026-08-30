@@ -58,31 +58,49 @@ def get_next_close_timestamps():
 ts_1h, ts_1d, ts_1w, ts_1m = get_next_close_timestamps()
 
 # ============================================================
-# INISIALISASI HISTORI (REST API OKX)
+# FUNGSI PENARIK DATA REAL-TIME (MULTI-THREADING FAST FETCH)
 # ============================================================
-def fetch_initial_candles():
-  for symbol in PAIRS:
-      for tf in TIMEFRAMES:
-          url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={tf}&limit={PERIOD_PPURE + 5}"
-          try:
-            res = requests.get(url, timeout=10).json()
+def fetch_single_pair(symbol):
+    pair_data = {}
+    for tf in TIMEFRAMES:
+        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={tf}&limit={PERIOD_PPURE + 5}"
+        try:
+            res = requests.get(url, timeout=5).json()
             if res.get("code") == "0":
-              raw = res["data"]
-              raw.reverse()
-              with data_lock:
-                st.session_state.candle_data[symbol][tf] = {
+                raw = res["data"]
+                raw.reverse()
+                pair_data[tf] = {
                     "opens": [float(item[1]) for item in raw],
                     "closes": [float(item[4]) for item in raw],
                     "volumes": [float(item[5]) for item in raw],
                     "last_ts": int(raw[-1][0]),
                 }
-          except: pass
-          time.sleep(0.05)
+        except: pass
+    return symbol, pair_data
 
-if 'initialized' not in st.session_state:
-    with st.spinner("Menarik data historis multi-timeframe 1H, 1D, 1W, 1M dari OKX..."):
-        fetch_initial_candles()
-    st.session_state.initialized = True
+def update_all_market_data():
+    threads = []
+    results = {}
+    
+    def worker(sym):
+        s_name, data = fetch_single_pair(sym)
+        results[s_name] = data
+
+    for symbol in PAIRS:
+        t = threading.Thread(target=worker, args=(symbol,))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    with data_lock:
+        for sym, data in results.items():
+            if data:
+                st.session_state.candle_data[sym] = data
+
+# Jalankan penarikan data terbaru setiap kali halaman di-render
+update_all_market_data()
 
 # ============================================================
 # FUNGSI METODE ZF-SCORE (FORMULA V16.6)
@@ -175,5 +193,6 @@ with data_lock:
 if st.button("🔄 Refresh Data Manual"):
     st.rerun()
 
+# Auto-refresh otomatis setiap 15 detik
 time.sleep(15)
 st.rerun()
