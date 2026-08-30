@@ -8,30 +8,44 @@ import websocket
 import datetime
 import calendar
 import pandas as pd
+import os
 
 # ============================================================
-# KONFIGURASI
+# KONFIGURASI ZF-CORE V16.3-AUTO (SESUAI BUKU BESAR)
 # ============================================================
-st.set_page_config(page_title="ZF-CORE Dashboard", layout="wide")
+st.set_page_config(page_title="ZF-CORE Omni Dashboard", layout="wide")
 
 PERIOD_PPURE = 20
 TIMEFRAMES = ["1H", "4H", "1D", "1W", "1M"]
-# Timeframe yang di-align OKX ke UTC+8 (HK time) secara default dan butuh
-# suffix "utc" agar align ke UTC (biar konsisten dengan get_candle_countdown).
 UTC_ALIGNED_TF = {"1D", "1W", "1M"}
 PAIRS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT",
     "ADA-USDT", "AVAX-USDT", "LINK-USDT", "SUI-USDT", "SHIB-USDT",
 ]
-
-# Konstanta skala untuk dRes (persen) sebelum masuk tanh().
-# dRes dihitung dalam persen (mis. 9.9 = 9.9%). tanh(9.9) sudah ~1.0 sejak
-# x > ~3, jadi ZF langsung mentok "SHORT" walau deviasi masih wajar.
-# Membaginya dengan skala ini membuat ZF merespons secara gradual.
-DRES_SCALE = 5.0  # x% deviasi -> tanh(x/DRES_SCALE); sesuaikan sesuai kalibrasi
+ARCHIVE_FILE = "zf_archival_vault.json"
+DRES_SCALE = 5.0  
 
 # ============================================================
-# FUNGSI COUNTDOWN (SISA WAKTU CANDLE)
+# PROTOKOL ARSIP & MEMORI SESI (BAB 8 & 9)
+# ============================================================
+def load_archival_vault():
+    if os.path.exists(ARCHIVE_FILE):
+        try:
+            with open(ARCHIVE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_archival_vault(vault_data):
+    try:
+        with open(ARCHIVE_FILE, "w") as f:
+            json.dump(vault_data, f, indent=4)
+    except Exception:
+            pass
+
+# ============================================================
+# FUNGSI COUNTDOWN SISA WAKTU CANDLE
 # ============================================================
 def get_candle_countdown(tf):
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -63,12 +77,14 @@ def get_candle_countdown(tf):
         return "N/A"
 
 # ============================================================
-# INISIALISASI & BACKGROUND TASKS (CACHE AGAR TIDAK RESTART)
+# INISIALISASI & BACKGROUND TASKS
 # ============================================================
 @st.cache_resource
 def init_system():
+    vault = load_archival_vault()
     state = {
         "candle_data": {symbol: {tf: {} for tf in TIMEFRAMES} for symbol in PAIRS},
+        "session_vault": vault,
         "ws_status": "Menghubungkan...",
         "last_message_time": time.time(),
         "last_error": None,
@@ -76,10 +92,6 @@ def init_system():
     }
 
     def _bar_param(tf):
-        # 1D/1W/1M perlu suffix "utc" agar align dengan UTC, sama seperti
-        # perhitungan countdown di get_candle_countdown(). Tanpa ini, OKX
-        # menutup candle tersebut di 00:00 waktu HK (UTC+8), beda 8 jam
-        # dari yang ditampilkan di UI.
         return f"{tf}utc" if tf in UTC_ALIGNED_TF else tf
 
     def _try_fetch_candles(symbol, tf, endpoint):
@@ -112,7 +124,7 @@ def init_system():
                             "volumes": [float(item[5]) for item in candles_fetched],
                             "last_ts": int(candles_fetched[-1][0]),
                         }
-                time.sleep(0.1)
+                time.sleep(0.05)
 
     def on_message(ws, message):
         if message == "pong": return
@@ -120,9 +132,6 @@ def init_system():
             data = json.loads(message)
             if "data" in data and "arg" in data:
                 symbol, channel = data["arg"]["instId"], data["arg"]["channel"]
-                # Channel WS untuk timeframe UTC-aligned datang sebagai
-                # "candle1Dutc" dsb -- strip "utc" agar key kembali cocok
-                # dengan TIMEFRAMES ("1D", bukan "1Dutc").
                 tf = channel.replace("candle", "")
                 if tf.endswith("utc"):
                     tf = tf[:-3]
@@ -169,33 +178,50 @@ def init_system():
 system_state = init_system()
 
 # ============================================================
-# PERHITUNGAN ZF
+# FORMULASI MATEMATIS ZF-CORE (BAB 4: PURE, DRES, DECAY, ZF-SCORE)
 # ============================================================
-def calculate_zf(closes, volumes):
+def calculate_zf_deterministic(closes, volumes):
     if len(closes) < PERIOD_PPURE:
-        return 0.0, 0.0, "LOADING"
+        return 0.0, 0.0, 0.0, "LOADING"
 
-    pMarket, vNow = closes[-1], volumes[-1]
-    pPure = sum(closes[-PERIOD_PPURE:]) / PERIOD_PPURE
-    vAvg = sum(volumes[-PERIOD_PPURE:]) / PERIOD_PPURE
+    pMarket = closes[-1]
+    sub_closes = closes[-PERIOD_PPURE:]
+    sub_vols = volumes[-PERIOD_PPURE:]
+    
+    # 4.1 P_pure: Harga titik keseimbangan resonansi rata-rata tertimbang likuiditas terintegrasi
+    total_vol = sum(sub_vols)
+    if total_vol > 0:
+        pPure = sum(c * v for c, v in zip(sub_closes, sub_vols)) / total_vol
+    else:
+        pPure = sum(sub_closes) / PERIOD_PPURE
 
-    dRes = abs(pMarket - pPure) / pPure * 100.0 if pPure > 0 else 0.0
-    # Dibandingkan terhadap rata-rata volume (vAvg), bukan volume sekarang
-    # (vNow) -- membagi dengan vNow membuat rasio meledak ke 1.0 saat
-    # volume sekarang kecil, walau penyimpangan sebenarnya kecil.
-    volRatio = min(abs(vNow - vAvg) / vAvg, 1.0) if vAvg > 0 else 0.5
-    # dRes diskalakan (DRES_SCALE) sebelum tanh() agar ZF merespons secara
-    # gradual, bukan langsung saturasi ke 1.0 begitu deviasi > ~3%.
-    zf = min(volRatio * math.tanh(dRes / DRES_SCALE), 1.0)
+    # 4.1 Rumus Topological Drift (D_res)
+    dRes = (abs(pMarket - pPure) / pPure) * 100.0 if pPure > 0 else 0.0
 
-    if zf > 0.8: return zf, dRes, "🔴 SHORT"
-    elif zf <= 0.45 and dRes < 0.4: return zf, dRes, "🟢 BUY"
-    else: return zf, dRes, "🟡 WAIT"
+    # 4.2 Koefisien elastisitas likuiditas (\lambda) & Decay_t (Integrasi Peluruhan)
+    v_mean = total_vol / PERIOD_PPURE if PERIOD_PPURE > 0 else 1.0
+    v_abs = abs(volumes[-1] - v_mean)
+    lambda_elasticity = v_abs / v_mean if v_mean > 0 else 0.1
+    decay_t = lambda_elasticity * dRes
+
+    # 4.3 Indeks Resonansi Rapuh (ZF-Score) berbasis rasio volume absolut terhadap total order book
+    v_total_book = total_vol * 1.5  # Aproksimasi total order book depth dari akumulasi volume
+    v_ratio = v_abs / v_total_book if v_total_book > 0 else 0.5
+    zf = min(v_ratio * math.tanh(dRes / DRES_SCALE), 1.0)
+
+    if zf > 0.8: 
+        status = "🔴 SHORT (Kritis)"
+    elif zf <= 0.45 and dRes < 0.4: 
+        status = "🟢 BUY (Laminar)"
+    else: 
+        status = "🟡 WAIT (Konsolidasi)"
+
+    return zf, dRes, decay_t, status
 
 # ============================================================
-# UI STREAMLIT DASHBOARD
+# UI STREAMLIT DASHBOARD (ZF-CORE V16.3-AUTO)
 # ============================================================
-st.title("🤖 ZF-CORE V16.6 Dashboard")
+st.title("🤖 ZF-CORE V16.3-AUTO Omni Dashboard")
 
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("1H Candle", get_candle_countdown("1H"))
@@ -207,6 +233,8 @@ col5.metric("1M Candle", get_candle_countdown("1M"))
 st.divider()
 
 table_data = []
+vault_snapshot = {}
+
 with system_state["data_lock"]:
     for symbol in PAIRS:
         row = {"Pair": symbol.replace("-USDT", "")}
@@ -222,17 +250,24 @@ with system_state["data_lock"]:
         for tf in TIMEFRAMES:
             s_data = system_state["candle_data"][symbol].get(tf, {})
             if "closes" in s_data and len(s_data["closes"]) >= PERIOD_PPURE:
-                zf, dRes, status = calculate_zf(s_data["closes"], s_data["volumes"])
-                row[tf] = f"{status} (ZF: {zf:.2f} | dR: {dRes:.1f}%)"
+                zf, dRes, decay_t, status = calculate_zf_deterministic(s_data["closes"], s_data["volumes"])
+                row[tf] = f"{status} | ZF:{zf:.2f} | dR:{dRes:.1f}% | Dec:{decay_t:.2f}"
+                
+                # Snapshot untuk Arsip Otonom (Bab 9)
+                vault_snapshot[f"{symbol}_{tf}"] = {"zf": zf, "d_res": dRes, "decay": decay_t}
             else:
                 row[tf] = "Loading..."
         table_data.append(row)
+
+# Simpan otomatis ke Archival Vault
+system_state["session_vault"] = vault_snapshot
+save_archival_vault(vault_snapshot)
 
 df = pd.DataFrame(table_data)
 st.dataframe(df, use_container_width=True, hide_index=True)
 
 since_last = int(time.time() - system_state["last_message_time"])
-status_text = f"📡 WebSocket: {system_state['ws_status']} | Terakhir update: {since_last} detik yang lalu"
+status_text = f"📡 WebSocket: {system_state['ws_status']} | Vault Synced | Terakhir update: {since_last} detik yang lalu"
 if since_last > 30:
     st.error(status_text + " (Data mungkin tertinggal!)")
 else:
