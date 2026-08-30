@@ -117,11 +117,12 @@ def _extract_field(item, *names):
     return None
 
 
-def fetch_history(symbol: str, tf: str, limit: int = PERIOD_PPURE):
+def fetch_history(symbol: str, tf: str, limit: int = PERIOD_PPURE, max_retries: int = 4):
     """Fetch the last `limit` real OHLC candles for symbol/tf from Indodax's
     official history endpoint, returned oldest -> newest as candle dicts.
     Returns (candles, error) — error is None on success, else a short
-    diagnostic string so failures are visible instead of silently empty."""
+    diagnostic string so failures are visible instead of silently empty.
+    Retries with backoff on HTTP 429 (rate limit)."""
     span = TIMEFRAME_SECONDS[tf]
     now = int(time.time())
     from_ts = now - span * (limit + 5)
@@ -132,10 +133,22 @@ def fetch_history(symbol: str, tf: str, limit: int = PERIOD_PPURE):
         "from": from_ts,
         "to": now,
     }
-    try:
-        resp = requests.get(HISTORY_URL, params=params, headers=HISTORY_HEADERS, timeout=6)
-    except Exception as e:
-        return [], f"request failed: {e}"
+
+    resp = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(HISTORY_URL, params=params, headers=HISTORY_HEADERS, timeout=6)
+        except Exception as e:
+            return [], f"request failed: {e}"
+
+        if resp.status_code == 429:
+            if attempt >= max_retries:
+                return [], f"HTTP 429 after {max_retries} retries: {resp.text[:120]!r}"
+            retry_after = resp.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else (2 ** attempt) * 1.5
+            time.sleep(wait)
+            continue
+        break  # got a non-429 response, stop retrying
 
     if resp.status_code != 200:
         return [], f"HTTP {resp.status_code}: {resp.text[:120]!r}"
@@ -218,6 +231,10 @@ def init_system():
                         state["seed_ok_count"] += 1
                     if error:
                         state["seed_errors"].append(f"{symbol} {tf}: {error}")
+                    state["connection_status"] = (
+                        f"Memuat data historis... ({state['seed_ok_count']}/{state['seed_total']})"
+                    )
+                time.sleep(0.6)  # spread requests out to stay under the rate limit
         with state["data_lock"]:
             state["connection_status"] = "Menghubungkan WebSocket..."
 
