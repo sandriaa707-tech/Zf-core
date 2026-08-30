@@ -9,7 +9,7 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# KONFIGURASI ZF-CORE V16.6 (MOBILE VERTICAL LAYOUT)
+# KONFIGURASI ZF-CORE V16.6 (ALL PAIRS MOBILE VERTICAL CARDS)
 # ============================================================
 st.set_page_config(page_title="OANDA ZF-CORE Mobile", layout="centered")
 
@@ -174,11 +174,10 @@ def calculate_zf_deterministic(closes, volumes):
     return zf, dRes, decay_t, status
 
 # ============================================================
-# UI STREAMLIT DASHBOARD (VERTICAL MOBILE LAYOUT)
+# UI STREAMLIT DASHBOARD (ALL PAIRS VERTICAL MOBILE LAYOUT)
 # ============================================================
 st.title("🤖 ZF-CORE Mobile")
 
-# Countdown ringkas untuk mobile
 with st.expander("⏳ Sisa Waktu Candle (UTC)", expanded=False):
     col1, col2, col3 = st.columns(3)
     col1.metric("H1", get_candle_countdown("H1"))
@@ -187,53 +186,53 @@ with st.expander("⏳ Sisa Waktu Candle (UTC)", expanded=False):
 
 st.divider()
 
-# Membangun Tampilan Vertikal (Card / Selectbox per Pair)
+# Menampilkan Semua Pair secara Vertikal
 with system_state["data_lock"]:
-    selected_pair = st.selectbox("Pilih Pair Aset:", [s.replace("_", "/") for s in PAIRS])
-    raw_symbol = selected_pair.replace("/", "_")
-
-    # Ambil tren harian
-    trend_icon = "⚪"
-    s_d = system_state["candle_data"][raw_symbol].get("D", {})
-    if "opens" in s_d and "closes" in s_d and len(s_d["opens"]) > 0:
-        trend_icon = "🟢" if s_d["closes"][-1] >= s_d["opens"][-1] else "🔴"
-
-    # Harga terakhir H1
-    current_price = 0.0
-    s_data_h1 = system_state["candle_data"][raw_symbol].get("H1", {})
-    if "closes" in s_data_h1 and len(s_data_h1["closes"]) > 0:
-        current_price = s_data_h1["closes"][-1]
-
-    price_str = f"${current_price:,.2f}" if "XAU" in raw_symbol else f"{current_price:,.5f}"
-    if current_price == 0.0: price_str = "-"
-
-    st.subheader(f"{selected_pair} {trend_icon} — {price_str}")
-
-    vertical_table_data = []
-    for tf in TIMEFRAMES:
-        col_label = "MN" if tf == "M" else (tf + "1" if tf in ("D", "W") else tf)
-        s_data = system_state["candle_data"][raw_symbol].get(tf, {})
+    for symbol in PAIRS:
+        pair_name = symbol.replace("_", "/")
         
-        if "closes" in s_data and len(s_data["closes"]) >= PERIOD_PPURE:
-            zf, dRes, decay_t, status = calculate_zf_deterministic(s_data["closes"], s_data["volumes"])
-            vertical_table_data.append({
-                "Timeframe": col_label,
-                "Status": status,
-                "ZF-Score": f"{zf:.2f}",
-                "dRes": f"{dRes:.1f}%",
-                "Decay": f"{decay_t:.2f}"
-            })
-        else:
-            vertical_table_data.append({
-                "Timeframe": col_label,
-                "Status": "Loading...",
-                "ZF-Score": "-",
-                "dRes": "-",
-                "Decay": "-"
-            })
+        # Trend harian
+        trend_icon = "⚪"
+        s_d = system_state["candle_data"][symbol].get("D", {})
+        if "opens" in s_d and "closes" in s_d and len(s_d["opens"]) > 0:
+            trend_icon = "🟢" if s_d["closes"][-1] >= s_d["opens"][-1] else "🔴"
 
-    df_vertical = pd.DataFrame(vertical_table_data)
-    st.dataframe(df_vertical, use_container_width=True, hide_index=True)
+        # Harga terkini H1
+        current_price = 0.0
+        s_data_h1 = system_state["candle_data"][symbol].get("H1", {})
+        if "closes" in s_data_h1 and len(s_data_h1["closes"]) > 0:
+            current_price = s_data_h1["closes"][-1]
+
+        price_str = f"${current_price:,.2f}" if "XAU" in symbol else f"{current_price:,.5f}"
+        if current_price == 0.0: price_str = "-"
+
+        # Membuat expander vertikal untuk setiap pair mencakup H1, H4, D1, W1, MN
+        with st.expander(f"{pair_name} {trend_icon} — {price_str}", expanded=False):
+            pair_table_data = []
+            for tf in TIMEFRAMES:
+                col_label = "MN" if tf == "M" else (tf + "1" if tf in ("D", "W") else tf)
+                s_data = system_state["candle_data"][symbol].get(tf, {})
+                
+                if "closes" in s_data and len(s_data["closes"]) >= PERIOD_PPURE:
+                    zf, dRes, decay_t, status = calculate_zf_deterministic(s_data["closes"], s_data["volumes"])
+                    pair_table_data.append({
+                        "Timeframe": col_label,
+                        "Status": status,
+                        "ZF-Score": f"{zf:.2f}",
+                        "dRes": f"{dRes:.1f}%",
+                        "Decay": f"{decay_t:.2f}"
+                    })
+                else:
+                    pair_table_data.append({
+                        "Timeframe": col_label,
+                        "Status": "Loading...",
+                        "ZF-Score": "-",
+                        "dRes": "-",
+                        "Decay": "-"
+                    })
+
+            df_pair = pd.DataFrame(pair_table_data)
+            st.dataframe(df_pair, use_container_width=True, hide_index=True)
 
 st.divider()
 
