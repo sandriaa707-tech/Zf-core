@@ -1,17 +1,47 @@
 import json
 import math
-import os
-import sys
 import threading
 import time
 import requests
-import websocket
 import datetime
 import calendar
+import streamlit as st
+import streamlit.components.v1 as components
 
 # ============================================================
-# KONFIGURASI
+# KONFIGURASI HALAMAN WEB
 # ============================================================
+st.set_page_config(
+    page_title="ZF-Core V16.6 Omni Terminal Web",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; color: #c9d1d9; font-family: 'Courier New', Courier, monospace; }
+    h1, h2, h3 { color: #58a6ff; font-family: 'Courier New', Courier, monospace; }
+    .card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 10px;
+        padding: 15px;
+        margin-bottom: 15px;
+    }
+    .card-title {
+        font-size: 18px;
+        font-weight: bold;
+        color: #f0883e;
+        margin-bottom: 8px;
+    }
+    .tf-row {
+        font-size: 14px;
+        margin: 4px 0;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 PERIOD_PPURE = 20
 TIMEFRAMES = ["1H", "1D", "1W", "1M"] 
 
@@ -20,71 +50,62 @@ PAIRS = [
     "ADA-USDT", "AVAX-USDT", "LINK-USDT", "SUI-USDT", "SHIB-USDT",
 ]
 
-COLOR_RED = "\033[91m"
-COLOR_GREEN = "\033[92m"
-COLOR_YELLOW = "\033[93m"
-COLOR_CYAN = "\033[96m"
-COLOR_WHITE = "\033[97m"
-COLOR_RESET = "\033[0m"
+if 'candle_data' not in st.session_state:
+    st.session_state.candle_data = {symbol: {tf: {"opens": [], "closes": [], "volumes": [], "last_ts": 0} for tf in TIMEFRAMES} for symbol in PAIRS}
 
-candle_data = {symbol: {tf: {} for tf in TIMEFRAMES} for symbol in PAIRS}
 data_lock = threading.Lock()
 
 # ============================================================
-# FUNGSI COUNTDOWN (SISA WAKTU CANDLE) - BASIS UTC
+# HITUNG TARGET WAKTU UTC (TIMESTAMP) UNTUK JAVASCRIPT
 # ============================================================
-def get_candle_countdown(tf):
+def get_next_close_timestamps():
     now = datetime.datetime.utcnow()
     try:
-        if tf == "1H":
-            next_close = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        elif tf == "1D":
-            next_close = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        elif tf == "1W":
-            days_ahead = 7 - now.weekday()
-            next_close = (now + datetime.timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
-        elif tf == "1M":
-            _, last_day = calendar.monthrange(now.year, now.month)
-            next_close = (now.replace(day=1) + datetime.timedelta(days=last_day)).replace(hour=0, minute=0, second=0, microsecond=0)
-        else:
-            return "-"
-            
-        diff = next_close - now
-        total_seconds = int(diff.total_seconds())
-        days, hours = total_seconds // 86400, (total_seconds % 86400) // 3600
-        minutes, seconds = (total_seconds % 3600) // 60, total_seconds % 60
+        next_1h = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        next_1d = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        days_ahead = 7 - now.weekday()
+        next_1w = (now + datetime.timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
+        _, last_day = calendar.monthrange(now.year, now.month)
+        next_1m = (now.replace(day=1) + datetime.timedelta(days=last_day)).replace(hour=0, minute=0, second=0, microsecond=0)
         
-        if days > 0: return f"{days}d {hours}h"
-        elif hours > 0: return f"{hours}h {minutes}m"
-        else: return f"{minutes}m {seconds}s"
-    except: return "N/A"
+        return int(next_1h.timestamp()*1000), int(next_1d.timestamp()*1000), int(next_1w.timestamp()*1000), int(next_1m.timestamp()*1000)
+    except:
+        return 0, 0, 0, 0
+
+ts_1h, ts_1d, ts_1w, ts_1m = get_next_close_timestamps()
 
 # ============================================================
-# INSIALISASI HISTORI (REST API OKX)
+# INISIALISASI HISTORI (REST API OKX)
 # ============================================================
-def fetch_initial_candles(symbol):
-  for tf in TIMEFRAMES:
-      url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={tf}&limit={PERIOD_PPURE + 5}"
-      try:
-        res = requests.get(url, timeout=10).json()
-        if res.get("code") == "0":
-          raw = res["data"]
-          raw.reverse()
-          with data_lock:
-            candle_data[symbol][tf] = {
-                "opens": [float(item[1]) for item in raw],
-                "closes": [float(item[4]) for item in raw],
-                "volumes": [float(item[5]) for item in raw],
-                "last_ts": int(raw[-1][0]),
-            }
-      except: pass
-      time.sleep(0.1) 
+def fetch_initial_candles():
+  for symbol in PAIRS:
+      for tf in TIMEFRAMES:
+          url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={tf}&limit={PERIOD_PPURE + 5}"
+          try:
+            res = requests.get(url, timeout=10).json()
+            if res.get("code") == "0":
+              raw = res["data"]
+              raw.reverse()
+              with data_lock:
+                st.session_state.candle_data[symbol][tf] = {
+                    "opens": [float(item[1]) for item in raw],
+                    "closes": [float(item[4]) for item in raw],
+                    "volumes": [float(item[5]) for item in raw],
+                    "last_ts": int(raw[-1][0]),
+                }
+          except: pass
+          time.sleep(0.05)
+
+if 'initialized' not in st.session_state:
+    with st.spinner("Menarik data historis multi-timeframe 1H, 1D, 1W, 1M dari OKX..."):
+        fetch_initial_candles()
+    st.session_state.initialized = True
 
 # ============================================================
 # FUNGSI METODE ZF-SCORE (FORMULA V16.6)
 # ============================================================
 def calculate_zf(closes, volumes):
-  if len(closes) < PERIOD_PPURE: return 0.0, 0.0, "W", COLOR_WHITE
+  if len(closes) < PERIOD_PPURE: return 0.0, 0.0, "WAIT", "#d29922"
 
   pMarket, vNow = closes[-1], volumes[-1]
   pPure = sum(closes[-PERIOD_PPURE:]) / PERIOD_PPURE
@@ -94,140 +115,98 @@ def calculate_zf(closes, volumes):
   volRatio = min(abs(vNow - vAvg) / vNow, 1.0) if vNow > 0 else 0.5
   zf = min(volRatio * math.tanh(dRes), 1.0)
 
-  if zf > 0.8: return zf, dRes, "S", COLOR_RED
-  elif zf <= 0.45 and dRes < 0.4: return zf, dRes, "B", COLOR_GREEN
-  else: return zf, dRes, "W", COLOR_YELLOW
+  if zf > 0.8: return zf, dRes, "SHORT", "#ff7b72"
+  elif zf <= 0.45 and dRes < 0.4: return zf, dRes, "BUY  ", "#3fb950"
+  else: return zf, dRes, "WAIT ", "#d29922"
 
 # ============================================================
-# RENDER DASHBOARD (DUAL ROW HORIZONTAL MATRIX)
+# TAMPILAN UTAMA WEB
 # ============================================================
-def render_dashboard():
-  print("\033[?25l\033[H", end="") 
-  
-  cd_1h = get_candle_countdown("1H")
-  cd_1d = get_candle_countdown("1D")
-  cd_1w = get_candle_countdown("1W")
-  cd_1m = get_candle_countdown("1M")
-  
-  print(f"{COLOR_CYAN}=== ZF V16.6 | DUAL-ROW MATRIX ==={COLOR_RESET}\033[K")
-  print(f"⏳ 1H({cd_1h})|1D({cd_1d})|1W({cd_1w})|1M({cd_1m})\033[K")
-  print("=" * 55 + "\033[K")
-  print(f"{'COIN/TF':<8} | {'PRICE':<9} | {'1H':<7} | {'1D':<7} | {'1W':<7} | {'1M':<7}\033[K")
-  print("=" * 55 + "\033[K")
+st.title("🤖 ZF-CORE V16.6 | OMNI WEB TERMINAL")
+st.markdown("Command Center Deterministic Protocol — Multi-Timeframe Analysis (1H, 1D, 1W, 1M).")
 
-  with data_lock:
-    for symbol in PAIRS:
-      current_price = 0.0
-      zf_blocks, dres_blocks = [], []
+# Live Countdown Widget via JS (1 Detik Halus)
+countdown_html = f"""
+<div style="display: flex; gap: 10px; justify-content: space-between; background: #161b22; padding: 12px; border-radius: 8px; border: 1px solid #30363d; font-family: monospace; color: #c9d1d9; margin-bottom: 20px;">
+    <div>⏱️ <b>1H:</b> <span id="cd-1h">--</span></div>
+    <div>📅 <b>1D:</b> <span id="cd-1d">--</span></div>
+    <div>📊 <b>1W:</b> <span id="cd-1w">--</span></div>
+    <div>🗓️ <b>1M:</b> <span id="cd-1m">--</span></div>
+</div>
 
-      for tf in TIMEFRAMES:
-          s_data = candle_data[symbol].get(tf, {})
-          if "closes" in s_data and len(s_data["closes"]) > 0:
-            current_price = s_data["closes"][-1]
-            zf, dRes, status, color = calculate_zf(s_data["closes"], s_data["volumes"])
-            
-            # Baris 1: ZF-Score & Status
-            zf_str = f"{zf:3.2f}[{status}]"
-            zf_blocks.append(f"{color}{zf_str:<7}{COLOR_RESET}")
-            
-            # Baris 2: dRes (Resonansi %)
-            dres_str = f"{dRes:5.1f}%"
-            dres_blocks.append(f"{color}{dres_str:<7}{COLOR_RESET}")
-          else:
-            zf_blocks.append(f"{'--':<7}")
-            dres_blocks.append(f"{'--':<7}")
-            
-      price_str = f"{current_price:.6f}" if current_price < 1 else f"{current_price:.2f}"
-      if current_price == 0.0: price_str = "-"
-      
-      # Pewarnaan harga berdasarkan 1D
-      price_color = COLOR_WHITE
-      s_1d = candle_data[symbol].get("1D", {})
-      if "opens" in s_1d and "closes" in s_1d and len(s_1d["opens"]) > 0:
-          if s_1d["closes"][-1] >= s_1d["opens"][-1]:
-              price_color = COLOR_GREEN
-          else:
-              price_color = COLOR_RED
+<script>
+const t1H = {ts_1h}, t1D = {ts_1d}, t1W = {ts_1w}, t1M = {ts_1m};
+function fmt(ms) {{
+    let s = Math.floor(ms / 1000);
+    if (s < 0) return "Closed";
+    let d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return d > 0 ? `${{d}}d ${{h}}h` : h > 0 ? `${{h}}h ${{m}}m` : `${{m}}m ${{sec}}s`;
+}}
+function upd() {{
+    let now = new Date().getTime();
+    document.getElementById("cd-1h").innerText = fmt(t1H - now);
+    document.getElementById("cd-1d").innerText = fmt(t1D - now);
+    document.getElementById("cd-1w").innerText = fmt(t1W - now);
+    document.getElementById("cd-1m").innerText = fmt(t1M - now);
+}}
+setInterval(upd, 1000); upd();
+</script>
+"""
+components.html(countdown_html, height=60)
 
-      display_sym = symbol.replace("-USDT", "")
-      price_padded = f"{price_str:<9}"
-      
-      # Cetak Baris 1 (Nama Koin, Harga, dan ZF Score tiap TF)
-      print(f"{display_sym:<8} | {price_color}{price_padded}{COLOR_RESET} | {zf_blocks[0]} | {zf_blocks[1]} | {zf_blocks[2]} | {zf_blocks[3]}\033[K")
-      # Cetak Baris 2 (Label dRes di bawahnya)
-      print(f"{' └ dR':<8} | {'':<9} | {dres_blocks[0]} | {dres_blocks[1]} | {dres_blocks[2]} | {dres_blocks[3]}\033[K")
-      print("-" * 55 + "\033[K")
-            
-  print("S=SHORT(Merah) | B=BUY(Hijau) | W=WAIT(Kuning)\033[K")
-  print("Ctrl+C = Keluar\033[K")
-  print("\033[J", end="")
+# Render Kartu Koin ala Telegram Bot dalam Grid Kolom Web
+cols = st.columns(2) # Membuat 2 kolom kartu agar rapi di layar HP/Desktop
 
-# ============================================================
-# TREAD KHUSUS DISPLAY (UI THROTTLING 1 DETIK)
-# ============================================================
-def display_loop():
-    while True:
-        render_dashboard()
-        time.sleep(1)
+with data_lock:
+    for idx, symbol in enumerate(PAIRS):
+        display_sym = symbol.replace("-USDT", "")
+        current_price = 0.0
+        
+        for tf in TIMEFRAMES:
+            s_data = st.session_state.candle_data[symbol].get(tf, {})
+            if "closes" in s_data and len(s_data["closes"]) > 0:
+                current_price = s_data["closes"][-1]
+                
+        price_str = f"{current_price:,.2f}" if current_price >= 1 else f"{current_price:.6f}"
+        if current_price == 0.0: price_str = "-"
+        
+        # Tren harian untuk warna indikator harga
+        trend_emoji = "⚪"
+        s_1d = st.session_state.candle_data[symbol].get("1D", {})
+        if "opens" in s_1d and "closes" in s_1d and len(s_1d["opens"]) > 0:
+            trend_emoji = "🟢" if s_1d["closes"][-1] >= s_1d["opens"][-1] else "🔴"
 
-# ============================================================
-# WEBSOCKET HANDLERS
-# ============================================================
-def on_message(ws, message):
-  if message == "pong": return
-  data = json.loads(message)
-  if "event" in data and data["event"] == "error": return 
+        card_html = f"""
+        <div class="card">
+            <div class="card-title">⚡ [ {display_sym} ] — ${price_str} {trend_emoji}</div>
+        """
+        
+        tf_icons = {"1H": "⏱️", "1D": "📅", "1W": "📊", "1M": "🗓️"}
+        
+        for tf in TIMEFRAMES:
+            s_data = st.session_state.candle_data[symbol].get(tf, {})
+            if "closes" in s_data and len(s_data["closes"]) > 0:
+                zf, dRes, status_text, color = calculate_zf(s_data["closes"], s_data["volumes"])
+                card_html += f"""
+                <div class="tf-row" style="color: {color};">
+                    &nbsp;&nbsp;<b>{tf_icons.get(tf, '🔹')} {tf}</b> : {zf:4.2f} [{status_text}] (dR: {dRes:4.1f}%)
+                </div>
+                """
+            else:
+                card_html += f"""
+                <div class="tf-row" style="color: #8b949e;">
+                    &nbsp;&nbsp;<b>{tf_icons.get(tf, '🔹')} {tf}</b> : Loading...
+                </div>
+                """
+        card_html += "</div>"
+        
+        # Masukkan ke kolom bergantian (Kiri / Kanan)
+        with cols[idx % 2]:
+            st.markdown(card_html, unsafe_allow_html=True)
 
-  if "data" in data and "arg" in data:
-    symbol, channel = data["arg"]["instId"], data["arg"]["channel"]
-    tf = channel.replace("candle", "") 
-    c_info = data["data"][0]
-    
-    ts, open_p, close_p, vol = int(c_info[0]), float(c_info[1]), float(c_info[4]), float(c_info[5])
+if st.button("🔄 Refresh Data Manual"):
+    st.rerun()
 
-    with data_lock:
-      if tf not in candle_data[symbol]: candle_data[symbol][tf] = {"opens": [], "closes": [], "volumes": [], "last_ts": ts}
-      s_data = candle_data[symbol][tf]
-
-      if "last_ts" in s_data and ts > s_data["last_ts"]:
-        s_data["opens"].append(open_p); s_data["closes"].append(close_p); s_data["volumes"].append(vol); s_data["last_ts"] = ts
-        if len(s_data["closes"]) > PERIOD_PPURE * 2: 
-            s_data["opens"].pop(0); s_data["closes"].pop(0); s_data["volumes"].pop(0)
-      elif "closes" in s_data and len(s_data["closes"]) > 0:
-        s_data["opens"][-1] = open_p; s_data["closes"][-1] = close_p; s_data["volumes"][-1] = vol
-      else:
-        s_data["opens"] = [open_p]; s_data["closes"] = [close_p]; s_data["volumes"] = [vol]; s_data["last_ts"] = ts
-
-def on_error(ws, error): pass
-def on_close(ws, close_status_code, close_msg): pass
-
-def on_open(ws):
-  args = [{"channel": f"candle{tf}", "instId": symbol} for symbol in PAIRS for tf in TIMEFRAMES]
-  ws.send(json.dumps({"op": "subscribe", "args": args}))
-
-def run_ws():
-  ws_url = "wss://ws.okx.com:8443/ws/v5/business"
-  ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
-  ws.run_forever(ping_interval=20, ping_timeout=10)
-
-# ============================================================
-# MAIN PROGRAM
-# ============================================================
-if __name__ == "__main__":
-  os.system("clear" if os.name != "nt" else "cls")
-  print(f"{COLOR_YELLOW}Menarik histori TF 1H, 1D, 1W, dan 1M... (Pastikan VPN aktif){COLOR_RESET}")
-  
-  threads = [threading.Thread(target=fetch_initial_candles, args=(p,)) for p in PAIRS]
-  for t in threads: t.start()
-  for t in threads: t.join()
-
-  os.system("clear" if os.name != "nt" else "cls")
-  
-  render_thread = threading.Thread(target=display_loop, daemon=True)
-  render_thread.start()
-  
-  try: run_ws()
-  except KeyboardInterrupt:
-    print("\033[?25h\033[H\033[J", end="")
-    print(f"{COLOR_CYAN}Sistem ZF-Core dihentikan. Kursor dikembalikan.{COLOR_RESET}")
-    sys.exit(0)
+# Auto-refresh halaman web setiap 15 detik untuk memperbarui harga pasar
+time.sleep(15)
+st.rerun()
