@@ -12,12 +12,12 @@ import pandas as pd
 # ============================================================
 # KONFIGURASI 
 # ============================================================
-st.set_page_config(page_title="ZF-CORE Dashboard (Favorite Pairs)", layout="wide")
+st.set_page_config(page_title="ZF-CORE Dashboard (Indodax WS)", layout="wide")
 
 PERIOD_PPURE = 20
 TIMEFRAMES = ["1H", "4H", "1D", "1W"]
 
-# Daftar pair disesuaikan dengan gambar Favorite Anda (format Indodax/Triv)
+# Daftar pair disesuaikan dengan gambar Favorite Anda (format Indodax)
 PAIRS = [
     "btc_idr", "eth_idr", "usdt_idr", "dot_idr",
     "btc_usdt", "xaut_idr", "usdc_idr", "sol_idr",
@@ -73,7 +73,6 @@ def init_system():
                 if "ticker" in res:
                     ticker = res["ticker"]
                     last_p = float(ticker["last"])
-                    # Ambil volume sesuai jenis pair (IDR atau USDT)
                     vol_p = float(ticker.get("vol_idr" if "idr" in symbol else "vol_usdt", 0))
                     
                     with state["data_lock"]:
@@ -89,12 +88,16 @@ def init_system():
             time.sleep(0.05)
 
     def on_message(ws, message):
+        if not message:
+            return
         try:
             data = json.loads(message)
-            if "ticker" in data or "market" in data:
+            if isinstance(data, dict):
                 market = data.get("market") or data.get("pair")
-                last_p = float(data.get("last", 0) or data.get("close", 0))
-                vol_p = float(data.get("vol", 0))
+                ticker_data = data.get("ticker", data)
+                
+                last_p = float(ticker_data.get("last", 0) or ticker_data.get("close", 0))
+                vol_p = float(ticker_data.get("vol", 0))
                 
                 if market in PAIRS and last_p > 0:
                     with state["data_lock"]:
@@ -107,15 +110,23 @@ def init_system():
         except Exception:
             pass
 
-    def on_error(ws, error): state["ws_status"] = "Error koneksi..."
-    def on_close(ws, code, msg): state["ws_status"] = "Terputus..."
+    def on_error(ws, error): 
+        state["ws_status"] = f"Error: {error}"
+
+    def on_close(ws, code, msg): 
+        state["ws_status"] = "Terputus..."
+
     def on_open(ws):
         state["ws_status"] = "Online (Real-time)"
-        sub_payload = {
-            "type": "subscribe",
-            "channels": [f"{symbol}.ticker" for symbol in PAIRS]
-        }
-        ws.send(json.dumps(sub_payload))
+        # Mengirimkan format subscribe yang valid untuk server Indodax
+        for symbol in PAIRS:
+            sub_msg = {
+                "event": "bts:subscribe",
+                "data": {
+                    "channel": f"{symbol}_ticker"
+                }
+            }
+            ws.send(json.dumps(sub_msg))
 
     def run_ws():
         while True:
@@ -177,7 +188,6 @@ with system_state["data_lock"]:
             if "closes" in s_data and len(s_data["closes"]) > 0:
                 current_price = s_data["closes"][-1]
         
-        # Format mata uang otomatis menyesuaikan (USDT atau IDR)
         if is_usdt_pair:
             row["Price"] = f"${current_price:,.2f}"
         else:
