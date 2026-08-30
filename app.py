@@ -94,12 +94,12 @@ def calculate_zf(closes, volumes):
   volRatio = min(abs(vNow - vAvg) / vNow, 1.0) if vNow > 0 else 0.5
   zf = min(volRatio * math.tanh(dRes), 1.0)
 
-  if zf > 0.8: return zf, dRes, "SHORT", COLOR_RED
-  elif zf <= 0.45 and dRes < 0.4: return zf, dRes, "BUY  ", COLOR_GREEN
-  else: return zf, dRes, "WAIT ", COLOR_YELLOW
+  if zf > 0.8: return zf, dRes, "S", COLOR_RED
+  elif zf <= 0.45 and dRes < 0.4: return zf, dRes, "B", COLOR_GREEN
+  else: return zf, dRes, "W", COLOR_YELLOW
 
 # ============================================================
-# RENDER DASHBOARD (TELEGRAM BOT STYLE)
+# RENDER DASHBOARD (DUAL ROW HORIZONTAL MATRIX)
 # ============================================================
 def render_dashboard():
   print("\033[?25l\033[H", end="") 
@@ -109,55 +109,57 @@ def render_dashboard():
   cd_1w = get_candle_countdown("1W")
   cd_1m = get_candle_countdown("1M")
   
-  print(f"{COLOR_CYAN}🤖 ZF-CORE V16.6 | TELEGRAM BOT FEED{COLOR_RESET}\033[K")
-  print(f"⏱️ 1H:{cd_1h} | 1D:{cd_1d} | 1W:{cd_1w} | 1M:{cd_1m}\033[K")
-  print("=" * 44 + "\033[K")
+  print(f"{COLOR_CYAN}=== ZF V16.6 | DUAL-ROW MATRIX ==={COLOR_RESET}\033[K")
+  print(f"⏳ 1H({cd_1h})|1D({cd_1d})|1W({cd_1w})|1M({cd_1m})\033[K")
+  print("=" * 55 + "\033[K")
+  print(f"{'COIN/TF':<8} | {'PRICE':<9} | {'1H':<7} | {'1D':<7} | {'1W':<7} | {'1M':<7}\033[K")
+  print("=" * 55 + "\033[K")
 
   with data_lock:
     for symbol in PAIRS:
       current_price = 0.0
+      zf_blocks, dres_blocks = [], []
+
       for tf in TIMEFRAMES:
           s_data = candle_data[symbol].get(tf, {})
           if "closes" in s_data and len(s_data["closes"]) > 0:
-              current_price = s_data["closes"][-1]
-              
-      price_str = f"{current_price:,.2f}" if current_price >= 1 else f"{current_price:.6f}"
+            current_price = s_data["closes"][-1]
+            zf, dRes, status, color = calculate_zf(s_data["closes"], s_data["volumes"])
+            
+            # Baris 1: ZF-Score & Status
+            zf_str = f"{zf:3.2f}[{status}]"
+            zf_blocks.append(f"{color}{zf_str:<7}{COLOR_RESET}")
+            
+            # Baris 2: dRes (Resonansi %)
+            dres_str = f"{dRes:5.1f}%"
+            dres_blocks.append(f"{color}{dres_str:<7}{COLOR_RESET}")
+          else:
+            zf_blocks.append(f"{'--':<7}")
+            dres_blocks.append(f"{'--':<7}")
+            
+      price_str = f"{current_price:.6f}" if current_price < 1 else f"{current_price:.2f}"
       if current_price == 0.0: price_str = "-"
       
-      # Tanda panah/ikon tren harga harian
-      trend_icon = "⚪"
+      # Pewarnaan harga berdasarkan 1D
+      price_color = COLOR_WHITE
       s_1d = candle_data[symbol].get("1D", {})
       if "opens" in s_1d and "closes" in s_1d and len(s_1d["opens"]) > 0:
           if s_1d["closes"][-1] >= s_1d["opens"][-1]:
-              trend_icon = "🟢"
+              price_color = COLOR_GREEN
           else:
-              trend_icon = "🔴"
+              price_color = COLOR_RED
 
       display_sym = symbol.replace("-USDT", "")
+      price_padded = f"{price_str:<9}"
       
-      # Header Kartu ala Telegram
-      print(f"⚡ {COLOR_YELLOW}[ {display_sym:<5} ]{COLOR_RESET} — ${price_str} {trend_icon}\033[K")
-      
-      tf_icons = {"1H": "⏱️", "1D": "📅", "1W": "📊", "1M": "🗓️"}
-      
-      for i, tf in enumerate(TIMEFRAMES):
-          is_last = (i == len(TIMEFRAMES) - 1)
-          prefix = "└" if is_last else "├"
-          icon = tf_icons.get(tf, "🔹")
-          
-          s_data = candle_data[symbol].get(tf, {})
-          if "closes" in s_data and len(s_data["closes"]) > 0:
-              zf, dRes, status_text, color = calculate_zf(s_data["closes"], s_data["volumes"])
-              
-              line_str = f" {prefix} {icon} {tf} : {zf:4.2f} [{status_text}] (dR: {dRes:4.1f}%)"
-              print(f"{color}{line_str}{COLOR_RESET}\033[K")
-          else:
-              print(f"{COLOR_WHITE} {prefix} {icon} {tf} : Loading...{COLOR_RESET}\033[K")
+      # Cetak Baris 1 (Nama Koin, Harga, dan ZF Score tiap TF)
+      print(f"{display_sym:<8} | {price_color}{price_padded}{COLOR_RESET} | {zf_blocks[0]} | {zf_blocks[1]} | {zf_blocks[2]} | {zf_blocks[3]}\033[K")
+      # Cetak Baris 2 (Label dRes di bawahnya)
+      print(f"{' └ dR':<8} | {'':<9} | {dres_blocks[0]} | {dres_blocks[1]} | {dres_blocks[2]} | {dres_blocks[3]}\033[K")
+      print("-" * 55 + "\033[K")
             
-      print(f"{COLOR_CYAN}────────────────────────────────────────────{COLOR_RESET}\033[K")
-            
-  print(f"{COLOR_WHITE}💡 [BUY]=Hijau | [SHORT]=Merah | [WAIT]=Kuning{COLOR_RESET}\033[K")
-  print(f"{COLOR_WHITE}⚠️ Tekan Ctrl+C untuk keluar terminal.{COLOR_RESET}\033[K")
+  print("S=SHORT(Merah) | B=BUY(Hijau) | W=WAIT(Kuning)\033[K")
+  print("Ctrl+C = Keluar\033[K")
   print("\033[J", end="")
 
 # ============================================================
