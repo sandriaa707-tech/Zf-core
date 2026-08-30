@@ -58,7 +58,6 @@ def get_candle_countdown(tf):
 # ============================================================
 @st.cache_resource
 def init_system():
-    # Gunakan dictionary untuk menyimpan state yang bisa dibagikan antar thread
     state = {
         "candle_data": {symbol: {tf: {} for tf in TIMEFRAMES} for symbol in PAIRS},
         "ws_status": "Menghubungkan...",
@@ -67,7 +66,6 @@ def init_system():
     }
 
     def _try_fetch_candles(symbol, tf, endpoint):
-        # NOTE: Jika di Streamlit Cloud OKX diblokir, ganti URL ini dengan Proxy API
         url = f"https://www.okx.com/api/v5/{endpoint}?instId={symbol}&bar={tf}&limit={PERIOD_PPURE + 5}"
         try:
             res = requests.get(url, timeout=10).json()
@@ -136,12 +134,10 @@ def init_system():
             ws.run_forever(ping_interval=20, ping_timeout=10)
             time.sleep(3)
 
-    # Menjalankan fetch data dan websocket di background saat aplikasi pertama kali dibuka
     fetch_initial_candles()
     threading.Thread(target=run_ws, daemon=True).start()
     return state
 
-# Jalankan inisialisasi
 system_state = init_system()
 
 # ============================================================
@@ -168,7 +164,6 @@ def calculate_zf(closes, volumes):
 # ============================================================
 st.title("🤖 ZF-CORE V16.6 Dashboard")
 
-# Header Countdown
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("1H Candle", get_candle_countdown("1H"))
 col2.metric("4H Candle", get_candle_countdown("4H"))
@@ -178,14 +173,12 @@ col5.metric("1M Candle", get_candle_countdown("1M"))
 
 st.divider()
 
-# Membangun Data Tabel
 table_data = []
 with system_state["data_lock"]:
     for symbol in PAIRS:
         row = {"Pair": symbol.replace("-USDT", "")}
         current_price = 0.0
         
-        # Cari harga terakhir
         for tf in TIMEFRAMES:
             s_data = system_state["candle_data"][symbol].get(tf, {})
             if "closes" in s_data and len(s_data["closes"]) > 0:
@@ -193,21 +186,19 @@ with system_state["data_lock"]:
         
         row["Price"] = f"${current_price:,.4f}"
 
-        # Hitung ZF setiap timeframe
         for tf in TIMEFRAMES:
             s_data = system_state["candle_data"][symbol].get(tf, {})
             if "closes" in s_data and len(s_data["closes"]) >= PERIOD_PPURE:
                 zf, dRes, status = calculate_zf(s_data["closes"], s_data["volumes"])
-                row[tf] = f"{status} (ZF: {zf:.2f})"
+                # BARIS YANG DIPERBARUI:
+                row[tf] = f"{status} (ZF: {zf:.2f} | dR: {dRes:.1f}%)"
             else:
                 row[tf] = "Loading..."
         table_data.append(row)
 
-# Tampilkan sebagai Dataframe/Tabel interaktif
 df = pd.DataFrame(table_data)
 st.dataframe(df, use_container_width=True, hide_index=True)
 
-# Status Footer
 since_last = int(time.time() - system_state["last_message_time"])
 status_text = f"📡 WebSocket: {system_state['ws_status']} | Terakhir update: {since_last} detik yang lalu"
 if since_last > 30:
@@ -215,6 +206,5 @@ if since_last > 30:
 else:
     st.success(status_text)
 
-# Auto-Refresh halaman setiap 2 detik
 time.sleep(2)
 st.rerun()
