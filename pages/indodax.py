@@ -98,12 +98,32 @@ def symbol_to_api_symbol(symbol: str) -> str:
 PAIR_TO_SYMBOL = {symbol_to_pair(s): s for s in PAIRS}
 
 
+HISTORY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://indodax.com/",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def _extract_field(item, *names):
+    """Try several possible key spellings (API casing has been inconsistent
+    across Indodax's docs vs live responses)."""
+    for name in names:
+        if isinstance(item, dict) and name in item:
+            return item[name]
+    return None
+
+
 def fetch_history(symbol: str, tf: str, limit: int = PERIOD_PPURE):
     """Fetch the last `limit` real OHLC candles for symbol/tf from Indodax's
-    official history endpoint, returned oldest -> newest as candle dicts."""
+    official history endpoint, returned oldest -> newest as candle dicts.
+    Returns (candles, error) — error is None on success, else a short
+    diagnostic string so failures are visible instead of silently empty."""
     span = TIMEFRAME_SECONDS[tf]
     now = int(time.time())
-    # Ask for a bit more than we need to absorb gaps / holes in the data.
     from_ts = now - span * (limit + 5)
 
     params = {
@@ -113,32 +133,52 @@ def fetch_history(symbol: str, tf: str, limit: int = PERIOD_PPURE):
         "to": now,
     }
     try:
-        resp = requests.get(HISTORY_URL, params=params, timeout=6)
+        resp = requests.get(HISTORY_URL, params=params, headers=HISTORY_HEADERS, timeout=6)
+    except Exception as e:
+        return [], f"request failed: {e}"
+
+    if resp.status_code != 200:
+        return [], f"HTTP {resp.status_code}: {resp.text[:120]!r}"
+
+    try:
         data = resp.json()
-    except Exception:
-        return []
+    except Exception as e:
+        return [], f"bad JSON: {e} (body: {resp.text[:120]!r})"
 
     if not isinstance(data, list):
-        return []
+        return [], f"unexpected response shape: {str(data)[:150]!r}"
+
+    if len(data) == 0:
+        return [], "empty candle list (no data in range)"
 
     by_bucket = {}
+    skipped = 0
     for item in data:
+        t = _extract_field(item, "Time", "time")
+        o = _extract_field(item, "Open", "open")
+        h = _extract_field(item, "High", "high")
+        l = _extract_field(item, "Low", "low")
+        c = _extract_field(item, "Close", "close")
+        v = _extract_field(item, "Volume", "volume")
         try:
-            ts = bucket_start(float(item["Time"]), tf)
+            ts = bucket_start(float(t), tf)
             candle = {
                 "ts": ts,
-                "open": float(item["Open"]),
-                "high": float(item["High"]),
-                "low": float(item["Low"]),
-                "close": float(item["Close"]),
-                "volume": float(item["Volume"]),
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c),
+                "volume": float(v) if v is not None else 0.0,
             }
-        except (KeyError, TypeError, ValueError):
+        except (TypeError, ValueError):
+            skipped += 1
             continue
-        by_bucket[ts] = candle  # de-dupe by bucket, keep the latest entry
+        by_bucket[ts] = candle
 
     ordered = [by_bucket[k] for k in sorted(by_bucket.keys())]
-    return ordered[-limit:]
+    if not ordered:
+        return [], f"all {len(data)} rows failed to parse (skipped={skipped})"
+    return ordered[-limit:], None
 
 
 # ============================================================
@@ -156,6 +196,9 @@ def init_system():
         "last_update_time": time.time(),
         "data_lock": threading.Lock(),
         "ws_app": None,
+        "seed_errors": [],       # list of "symbol tf: error" strings
+        "seed_ok_count": 0,
+        "seed_total": len(PAIRS) * len(TIMEFRAMES),
     }
 
     # --------------------------------------------------------
@@ -166,12 +209,15 @@ def init_system():
     def seed_historical():
         for symbol in PAIRS:
             for tf in TIMEFRAMES:
-                candles = fetch_history(symbol, tf, PERIOD_PPURE)
-                if candles:
-                    with state["data_lock"]:
+                candles, error = fetch_history(symbol, tf, PERIOD_PPURE)
+                with state["data_lock"]:
+                    if candles:
                         dq = state["candle_data"][symbol][tf]
                         dq.clear()
                         dq.extend(candles)
+                        state["seed_ok_count"] += 1
+                    if error:
+                        state["seed_errors"].append(f"{symbol} {tf}: {error}")
         with state["data_lock"]:
             state["connection_status"] = "Menghubungkan WebSocket..."
 
@@ -356,6 +402,21 @@ if since_last > STALE_THRESHOLD:
     st.error(status_text + " (Koneksi bermasalah!)")
 else:
     st.success(status_text)
+
+with system_state["data_lock"]:
+    seed_ok = system_state["seed_ok_count"]
+    seed_total = system_state["seed_total"]
+    seed_errors = list(system_state["seed_errors"])
+
+if seed_ok < seed_total:
+    with st.expander(f"⚠️ Diagnostik seed historis: {seed_ok}/{seed_total} berhasil"):
+        if seed_errors:
+            for line in seed_errors[:15]:
+                st.text(line)
+            if len(seed_errors) > 15:
+                st.text(f"... dan {len(seed_errors) - 15} error lainnya")
+        else:
+            st.text("Belum ada data error tercatat (masih memuat?)")
 
 time.sleep(2)
 st.rerun()
