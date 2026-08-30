@@ -9,12 +9,9 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
-# KONFIGURASI
+# KONFIGURASI ZF-CORE V16.6 (OANDA FOREX & GOLD)
 # ============================================================
-# Gunakan st.set_page_config jika ini adalah file utama (app.py). 
-# Jika di folder pages/, Streamlit akan otomatis mengikuti config halaman utama,
-# tetapi kita tetap bisa mengatur judul halamannya.
-st.set_page_config(page_title="OANDA ZF-CORE", layout="wide")
+st.set_page_config(page_title="OANDA ZF-CORE Omni Dashboard", layout="wide")
 
 OANDA_URL = "https://api-fxpractice.oanda.com"
 PERIOD_PPURE = 20
@@ -23,22 +20,21 @@ PAIRS = [
     "XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD",
     "USD_CAD", "NZD_USD", "EUR_GBP", "GBP_JPY", "EUR_JPY"
 ]
+DRES_SCALE = 5.0  # Faktor normalisasi skala dRes untuk fungsi tanh()
 
 # ============================================================
 # MANAJEMEN API KEY (STREAMLIT STYLE)
 # ============================================================
 api_key = ""
-# Coba ambil dari Streamlit Secrets terlebih dahulu
 if "OANDA_API_KEY" in st.secrets:
     api_key = st.secrets["OANDA_API_KEY"]
 else:
-    # Jika tidak ada di Secrets, sediakan input manual di Sidebar
     st.sidebar.warning("⚠️ API Key OANDA tidak ditemukan di Secrets.")
     api_key = st.sidebar.text_input("Masukkan OANDA API Key (Practice):", type="password")
 
 if not api_key:
     st.error("Silakan masukkan OANDA API Key untuk mulai menarik data.")
-    st.stop() # Hentikan proses jika API Key belum ada
+    st.stop()
 
 # ============================================================
 # FUNGSI COUNTDOWN (SISA WAKTU CANDLE)
@@ -107,7 +103,6 @@ def init_oanda_system():
 
     def fetch_oanda_data():
         while True:
-            # Ambil API key terbaru dari state
             current_key = state["active_api_key"]
             if not current_key:
                 time.sleep(2)
@@ -133,40 +128,60 @@ def init_oanda_system():
             else:
                 state["api_status_msg"] = "Menunggu sinkronisasi server/Rate limit..."
 
-            time.sleep(3) # Jeda antar request batch
+            time.sleep(3)
 
     threading.Thread(target=fetch_oanda_data, daemon=True).start()
     return state
 
 system_state = init_oanda_system()
-# Update active API Key in state based on user input / secrets
 system_state["active_api_key"] = api_key 
 
 # ============================================================
-# PERHITUNGAN ZF
+# FORMULASI MATEMATIS DETERMINISTIK (BAB 4: PURE, DRES, DECAY, ZF-SCORE)
 # ============================================================
-def calculate_zf(closes, volumes):
+def calculate_zf_deterministic(closes, volumes):
     if len(closes) < PERIOD_PPURE:
-        return 0.0, 0.0, "LOADING"
+        return 0.0, 0.0, 0.0, "LOADING"
 
-    pMarket, vNow = closes[-1], volumes[-1]
-    pPure = sum(closes[-PERIOD_PPURE:]) / PERIOD_PPURE
-    vAvg = sum(volumes[-PERIOD_PPURE:]) / PERIOD_PPURE
+    pMarket = closes[-1]
+    sub_closes = closes[-PERIOD_PPURE:]
+    sub_vols = volumes[-PERIOD_PPURE:]
+    
+    # Bab 4.1 P_pure: Titik keseimbangan resonansi rata-rata tertimbang likuiditas terintegrasi
+    total_vol = sum(sub_vols)
+    if total_vol > 0:
+        pPure = sum(c * v for c, v in zip(sub_closes, sub_vols)) / total_vol
+    else:
+        pPure = sum(sub_closes) / PERIOD_PPURE
 
-    dRes = abs(pMarket - pPure) / pPure * 100.0 if pPure > 0 else 0.0
-    volRatio = min(abs(vNow - vAvg) / vNow, 1.0) if vNow > 0 else 0.5
-    zf = min(volRatio * math.tanh(dRes), 1.0)
+    # Bab 4.1 Rumus Topological Drift (D_res)
+    dRes = (abs(pMarket - pPure) / pPure) * 100.0 if pPure > 0 else 0.0
 
-    if zf > 0.8: return zf, dRes, "🔴 SHORT"
-    elif zf <= 0.45 and dRes < 0.4: return zf, dRes, "🟢 BUY"
-    else: return zf, dRes, "🟡 WAIT"
+    # Bab 4.2 Koefisien elastisitas likuiditas (\lambda) & Decay_t (Akumulasi Energi)
+    v_mean = total_vol / PERIOD_PPURE if PERIOD_PPURE > 0 else 1.0
+    v_abs = abs(volumes[-1] - v_mean)
+    lambda_elasticity = v_abs / v_mean if v_mean > 0 else 0.1
+    decay_t = lambda_elasticity * dRes
+
+    # Bab 4.3 ZF-Score: Indeks Resonansi Rapuh berbasis rasio volume absolut dan normalisasi tanh()
+    v_total_book = total_vol * 1.5  # Aproksimasi kedalaman total order book dari volume transaksi
+    v_ratio = v_abs / v_total_book if v_total_book > 0 else 0.5
+    zf = min(v_ratio * math.tanh(dRes / DRES_SCALE), 1.0)
+
+    if zf > 0.8: 
+        status = "🔴 SHORT (Kritis)"
+    elif zf <= 0.45 and dRes < 0.4: 
+        status = "🟢 BUY (Laminar)"
+    else: 
+        status = "🟡 WAIT (Konsolidasi)"
+
+    return zf, dRes, decay_t, status
 
 # ============================================================
 # UI STREAMLIT DASHBOARD
 # ============================================================
 st.title("🤖 ZF-CORE V16.6 | OANDA (Forex & Gold)")
 
-# Header Countdown
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("H1 Candle", get_candle_countdown("H1"))
 col2.metric("H4 Candle", get_candle_countdown("H4"))
@@ -176,23 +191,19 @@ col5.metric("MN Candle", get_candle_countdown("M"))
 
 st.divider()
 
-# Membangun Data Tabel
 table_data = []
 with system_state["data_lock"]:
     for symbol in PAIRS:
-        # Menentukan trend harian (Daily Open vs Close)
         trend_icon = "⚪"
         s_d = system_state["candle_data"][symbol].get("D", {})
         if "opens" in s_d and "closes" in s_d and len(s_d["opens"]) > 0:
             trend_icon = "🟢" if s_d["closes"][-1] >= s_d["opens"][-1] else "🔴"
 
-        # Mengambil harga terakhir dari H1
         current_price = 0.0
         s_data_h1 = system_state["candle_data"][symbol].get("H1", {})
         if "closes" in s_data_h1 and len(s_data_h1["closes"]) > 0:
             current_price = s_data_h1["closes"][-1]
 
-        # Format harga (XAU lebih sedikit desimal dibanding Forex biasa)
         price_str = f"${current_price:,.2f}" if "XAU" in symbol else f"{current_price:,.5f}"
         if current_price == 0.0: price_str = "-"
 
@@ -201,25 +212,21 @@ with system_state["data_lock"]:
             "Price": price_str
         }
 
-        # Hitung ZF setiap timeframe
         for tf in TIMEFRAMES:
-            # Ubah label kolom agar lebih familiar (M -> MN, D -> D1)
             col_label = "MN" if tf == "M" else (tf + "1" if tf in ("D", "W") else tf)
             
             s_data = system_state["candle_data"][symbol].get(tf, {})
             if "closes" in s_data and len(s_data["closes"]) >= PERIOD_PPURE:
-                zf, dRes, status = calculate_zf(s_data["closes"], s_data["volumes"])
-                row[col_label] = f"{status} (ZF: {zf:.2f} | dR: {dRes:.1f}%)"
+                zf, dRes, decay_t, status = calculate_zf_deterministic(s_data["closes"], s_data["volumes"])
+                row[col_label] = f"{status} | ZF:{zf:.2f} | dR:{dRes:.1f}% | Dec:{decay_t:.2f}"
             else:
                 row[col_label] = "Loading..."
                 
         table_data.append(row)
 
-# Tampilkan DataFrame
 df = pd.DataFrame(table_data)
 st.dataframe(df, use_container_width=True, hide_index=True)
 
-# Status Footer
 if system_state["last_success_time"] == 0:
     st.info("🔄 Menunggu data pertama ditarik dari OANDA...")
 else:
@@ -230,6 +237,5 @@ else:
     else:
         st.success(status_text)
 
-# Rerun loop
 time.sleep(3)
 st.rerun()
