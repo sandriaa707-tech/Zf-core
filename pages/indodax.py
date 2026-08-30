@@ -2,352 +2,148 @@ import streamlit as st
 import math
 import threading
 import time
-import json
-import datetime
-import collections
 import requests
+import datetime
+import calendar
 import pandas as pd
-import websocket  # pip install websocket-client
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 # KONFIGURASI
 # ============================================================
-st.set_page_config(page_title="ZF-CORE Omni Dashboard", layout="wide")
+# Gunakan st.set_page_config jika ini adalah file utama (app.py). 
+# Jika di folder pages/, Streamlit akan otomatis mengikuti config halaman utama,
+# tetapi kita tetap bisa mengatur judul halamannya.
+st.set_page_config(page_title="OANDA ZF-CORE", layout="wide")
 
+OANDA_URL = "https://api-fxpractice.oanda.com"
 PERIOD_PPURE = 20
-TIMEFRAME_SECONDS = {
-    "1H": 3600,
-    "4H": 4 * 3600,
-    "1D": 24 * 3600,
-    "1W": 7 * 24 * 3600,
-}
-TIMEFRAMES = list(TIMEFRAME_SECONDS.keys())
-
-# Indodax's /tradingview/history_v2 timeframe codes for each of our timeframes.
-TF_API_CODE = {
-    "1H": "60",
-    "4H": "240",
-    "1D": "1D",
-    "1W": "1W",
-}
-
+TIMEFRAMES = ["H1", "H4", "D", "W", "M"]
 PAIRS = [
-    "btc_idr", "eth_idr", "usdt_idr", "dot_idr",
-    "btc_usdt", "xaut_idr", "usdc_idr", "sol_idr",
-    "bnb_idr", "trx_idr"
+    "XAU_USD", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD",
+    "USD_CAD", "NZD_USD", "EUR_GBP", "GBP_JPY", "EUR_JPY"
 ]
 
-STALE_THRESHOLD = 30  # seconds before we flag the connection as stuck
+# ============================================================
+# MANAJEMEN API KEY (STREAMLIT STYLE)
+# ============================================================
+api_key = ""
+# Coba ambil dari Streamlit Secrets terlebih dahulu
+if "OANDA_API_KEY" in st.secrets:
+    api_key = st.secrets["OANDA_API_KEY"]
+else:
+    # Jika tidak ada di Secrets, sediakan input manual di Sidebar
+    st.sidebar.warning("⚠️ API Key OANDA tidak ditemukan di Secrets.")
+    api_key = st.sidebar.text_input("Masukkan OANDA API Key (Practice):", type="password")
 
-# ---- Indodax Market Data WebSocket (official docs) ----
-WS_URL = "wss://ws3.indodax.com/ws/"
-WS_STATIC_TOKEN = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJleHAiOjE5NDY2MTg0MTV9."
-    "UR1lBM6Eqh0yWz-PVirw1uPCxe60FdchR8eNVdsskeo"
-)
-SUMMARY_CHANNEL = "market:summary-24h"
-
-# ---- Indodax OHLC history REST endpoint (used only to seed startup data) ----
-HISTORY_URL = "https://indodax.com/tradingview/history_v2"
-
+if not api_key:
+    st.error("Silakan masukkan OANDA API Key untuk mulai menarik data.")
+    st.stop() # Hentikan proses jika API Key belum ada
 
 # ============================================================
-# HELPERS
+# FUNGSI COUNTDOWN (SISA WAKTU CANDLE)
 # ============================================================
-def bucket_start(now_ts: float, tf: str) -> int:
-    """Return the epoch timestamp (UTC) marking the start of the candle
-    that `now_ts` currently falls into, aligned to UTC boundaries."""
-    span = TIMEFRAME_SECONDS[tf]
-    if tf == "1W":
-        now_dt = datetime.datetime.fromtimestamp(now_ts, tz=datetime.timezone.utc)
-        monday = (now_dt - datetime.timedelta(days=now_dt.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        return int(monday.timestamp())
-    return int(now_ts // span) * span
-
-
-def get_candle_countdown(tf: str) -> str:
-    now = time.time()
-    span = TIMEFRAME_SECONDS[tf]
-    start = bucket_start(now, tf)
-    remaining = max(0, int(start + span - now))
-    days, rem = divmod(remaining, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, seconds = divmod(rem, 60)
-
-    if days > 0:
-        return f"{days}d {hours}h"
-    elif hours > 0:
-        return f"{hours}h {minutes}m"
-    else:
-        return f"{minutes}m {seconds}s"
-
-
-def symbol_to_pair(symbol: str) -> str:
-    """'btc_idr' -> 'btcidr' (Indodax WS channel/pair format)."""
-    return symbol.replace("_", "")
-
-
-def symbol_to_api_symbol(symbol: str) -> str:
-    """'btc_idr' -> 'BTCIDR' (Indodax /tradingview/history_v2 symbol format)."""
-    return symbol.replace("_", "").upper()
-
-
-PAIR_TO_SYMBOL = {symbol_to_pair(s): s for s in PAIRS}
-
-
-HISTORY_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://indodax.com/",
-    "Accept": "application/json, text/plain, */*",
-}
-
-
-def _extract_field(item, *names):
-    """Try several possible key spellings (API casing has been inconsistent
-    across Indodax's docs vs live responses)."""
-    for name in names:
-        if isinstance(item, dict) and name in item:
-            return item[name]
-    return None
-
-
-def fetch_history(symbol: str, tf: str, limit: int = PERIOD_PPURE, max_retries: int = 4):
-    """Fetch the last `limit` real OHLC candles for symbol/tf from Indodax's
-    official history endpoint, returned oldest -> newest as candle dicts.
-    Returns (candles, error) — error is None on success, else a short
-    diagnostic string so failures are visible instead of silently empty.
-    Retries with backoff on HTTP 429 (rate limit)."""
-    span = TIMEFRAME_SECONDS[tf]
-    now = int(time.time())
-    from_ts = now - span * (limit + 5)
-
-    params = {
-        "symbol": symbol_to_api_symbol(symbol),
-        "tf": TF_API_CODE[tf],
-        "from": from_ts,
-        "to": now,
-    }
-
-    resp = None
-    for attempt in range(max_retries + 1):
-        try:
-            resp = requests.get(HISTORY_URL, params=params, headers=HISTORY_HEADERS, timeout=6)
-        except Exception as e:
-            return [], f"request failed: {e}"
-
-        if resp.status_code == 429:
-            if attempt >= max_retries:
-                return [], f"HTTP 429 after {max_retries} retries: {resp.text[:120]!r}"
-            retry_after = resp.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else (2 ** attempt) * 1.5
-            time.sleep(wait)
-            continue
-        break  # got a non-429 response, stop retrying
-
-    if resp.status_code != 200:
-        return [], f"HTTP {resp.status_code}: {resp.text[:120]!r}"
-
+def get_candle_countdown(tf):
+    now = datetime.datetime.now(datetime.timezone.utc)
     try:
-        data = resp.json()
-    except Exception as e:
-        return [], f"bad JSON: {e} (body: {resp.text[:120]!r})"
+        if tf == "H1":
+            next_close = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        elif tf == "H4":
+            next_close = (now + datetime.timedelta(hours=4 - now.hour % 4)).replace(minute=0, second=0, microsecond=0)
+        elif tf == "D":
+            next_close = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif tf == "W":
+            days_ahead = 7 - now.weekday()
+            next_close = (now + datetime.timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif tf == "M":
+            _, last_day = calendar.monthrange(now.year, now.month)
+            next_close = (now.replace(day=1) + datetime.timedelta(days=last_day)).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            return "-"
 
-    if not isinstance(data, list):
-        return [], f"unexpected response shape: {str(data)[:150]!r}"
+        diff = next_close - now
+        total_seconds = int(diff.total_seconds())
+        days, hours = total_seconds // 86400, (total_seconds % 86400) // 3600
+        minutes, seconds = (total_seconds % 3600) // 60, total_seconds % 60
 
-    if len(data) == 0:
-        return [], "empty candle list (no data in range)"
-
-    by_bucket = {}
-    skipped = 0
-    for item in data:
-        t = _extract_field(item, "Time", "time")
-        o = _extract_field(item, "Open", "open")
-        h = _extract_field(item, "High", "high")
-        l = _extract_field(item, "Low", "low")
-        c = _extract_field(item, "Close", "close")
-        v = _extract_field(item, "Volume", "volume")
-        try:
-            ts = bucket_start(float(t), tf)
-            candle = {
-                "ts": ts,
-                "open": float(o),
-                "high": float(h),
-                "low": float(l),
-                "close": float(c),
-                "volume": float(v) if v is not None else 0.0,
-            }
-        except (TypeError, ValueError):
-            skipped += 1
-            continue
-        by_bucket[ts] = candle
-
-    ordered = [by_bucket[k] for k in sorted(by_bucket.keys())]
-    if not ordered:
-        return [], f"all {len(data)} rows failed to parse (skipped={skipped})"
-    return ordered[-limit:], None
-
+        if days > 0: return f"{days}d {hours}h"
+        elif hours > 0: return f"{hours}h {minutes}m"
+        else: return f"{minutes}m {seconds}s"
+    except Exception:
+        return "N/A"
 
 # ============================================================
-# INISIALISASI: SEED HISTORIS + WEBSOCKET CLIENT
+# INISIALISASI & BACKGROUND TASKS PARALEL
 # ============================================================
 @st.cache_resource
-def init_system():
+def init_oanda_system():
     state = {
-        # candle_data[symbol][tf] -> deque of dicts: {ts, open, high, low, close, volume}
-        "candle_data": {
-            symbol: {tf: collections.deque(maxlen=PERIOD_PPURE) for tf in TIMEFRAMES}
-            for symbol in PAIRS
-        },
-        "connection_status": "Memuat data historis...",
-        "last_update_time": time.time(),
+        "candle_data": {symbol: {tf: {} for tf in TIMEFRAMES} for symbol in PAIRS},
+        "api_status_msg": "Memulai...",
+        "last_success_time": 0,
         "data_lock": threading.Lock(),
-        "ws_app": None,
-        "seed_errors": [],       # list of "symbol tf: error" strings
-        "seed_ok_count": 0,
-        "seed_total": len(PAIRS) * len(TIMEFRAMES),
+        "active_api_key": ""
     }
 
-    # --------------------------------------------------------
-    # 1) Seed each symbol/timeframe with REAL historical candles
-    #    so the table doesn't need to wait hours/weeks for the
-    #    buffer to fill purely from live ticks.
-    # --------------------------------------------------------
-    def seed_historical():
-        for symbol in PAIRS:
-            for tf in TIMEFRAMES:
-                candles, error = fetch_history(symbol, tf, PERIOD_PPURE)
-                with state["data_lock"]:
-                    if candles:
-                        dq = state["candle_data"][symbol][tf]
-                        dq.clear()
-                        dq.extend(candles)
-                        state["seed_ok_count"] += 1
-                    if error:
-                        state["seed_errors"].append(f"{symbol} {tf}: {error}")
-                    state["connection_status"] = (
-                        f"Memuat data historis... ({state['seed_ok_count']}/{state['seed_total']})"
-                    )
-                time.sleep(0.6)  # spread requests out to stay under the rate limit
-        with state["data_lock"]:
-            state["connection_status"] = "Menghubungkan WebSocket..."
-
-    seed_historical()  # runs once, synchronously, before the page first renders
-
-    # --------------------------------------------------------
-    # 2) Live updates via WebSocket keep the last candle of each
-    #    timeframe moving, and roll a new candle whenever the
-    #    bucket changes — same logic as the historical seed uses.
-    # --------------------------------------------------------
-    def apply_tick(symbol: str, price: float, volume: float):
-        now = time.time()
-        with state["data_lock"]:
-            for tf in TIMEFRAMES:
-                dq = state["candle_data"][symbol][tf]
-                start = bucket_start(now, tf)
-
-                if dq and dq[-1]["ts"] == start:
-                    c = dq[-1]
-                    c["close"] = price
-                    c["high"] = max(c["high"], price)
-                    c["low"] = min(c["low"], price)
-                    c["volume"] = volume
-                else:
-                    open_price = dq[-1]["close"] if dq else price
-                    dq.append({
-                        "ts": start,
-                        "open": open_price,
-                        "high": max(open_price, price),
-                        "low": min(open_price, price),
-                        "close": price,
-                        "volume": volume,
-                    })
-            state["last_update_time"] = now
-            state["connection_status"] = "Online (WebSocket Live)"
-
-    def on_open(ws):
-        auth_req = {"params": {"token": WS_STATIC_TOKEN}, "id": 1}
-        ws.send(json.dumps(auth_req))
-
-    def on_message(ws, message):
+    def fetch_single_candle(symbol, tf, current_key):
+        headers = {
+            "Authorization": f"Bearer {current_key}",
+            "Accept-Datetime-Format": "UNIX"
+        }
+        url = f"{OANDA_URL}/v3/instruments/{symbol}/candles"
+        params = {"granularity": tf, "count": PERIOD_PPURE + 5, "price": "M"}
         try:
-            msg = json.loads(message)
-        except json.JSONDecodeError:
-            return
+            res = requests.get(url, headers=headers, params=params, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                if "candles" in data:
+                    opens = [float(c["mid"]["o"]) for c in data["candles"]]
+                    closes = [float(c["mid"]["c"]) for c in data["candles"]]
+                    volumes = [float(c["volume"]) for c in data["candles"]]
+                    return symbol, tf, opens, closes, volumes, 200
+            return symbol, tf, [], [], [], res.status_code
+        except Exception:
+            return symbol, tf, [], [], [], 500
 
-        if msg.get("id") == 1 and "result" in msg:
-            sub_req = {
-                "method": 1,
-                "params": {"channel": SUMMARY_CHANNEL},
-                "id": 2,
-            }
-            ws.send(json.dumps(sub_req))
-            return
-
-        result = msg.get("result", {})
-        if result.get("channel") != SUMMARY_CHANNEL:
-            return
-
-        rows = result.get("data", {}).get("data", [])
-        for row in rows:
-            # [pair, epoch, last, low24h, high24h, price24hAgo, idr_volume24h, base_volume24h]
-            try:
-                pair, _epoch, last_price = row[0], row[1], row[2]
-                base_volume = row[7]
-            except (IndexError, TypeError):
+    def fetch_oanda_data():
+        while True:
+            # Ambil API key terbaru dari state
+            current_key = state["active_api_key"]
+            if not current_key:
+                time.sleep(2)
                 continue
 
-            symbol = PAIR_TO_SYMBOL.get(pair)
-            if symbol is None:
-                continue
+            tasks = [(s, t) for s in PAIRS for t in TIMEFRAMES]
+            success_count = 0
 
-            try:
-                price = float(last_price)
-                vol = float(base_volume)
-            except (TypeError, ValueError):
-                continue
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(fetch_single_candle, s, t, current_key) for s, t in tasks]
+                for future in as_completed(futures):
+                    symbol, tf, opens, closes, volumes, status = future.result()
+                    if status == 200 and len(closes) > 0:
+                        with state["data_lock"]:
+                            state["candle_data"][symbol][tf] = {
+                                "opens": opens, "closes": closes, "volumes": volumes
+                            }
+                        success_count += 1
 
-            apply_tick(symbol, price, vol)
+            if success_count > 0:
+                state["last_success_time"] = time.time()
+                state["api_status_msg"] = "Online (Fast Parallel Mode)"
+            else:
+                state["api_status_msg"] = "Menunggu sinkronisasi server/Rate limit..."
 
-    def on_error(ws, error):
-        with state["data_lock"]:
-            state["connection_status"] = f"Error: {error}"
+            time.sleep(3) # Jeda antar request batch
 
-    def on_close(ws, close_status_code, close_msg):
-        with state["data_lock"]:
-            state["connection_status"] = "Terputus, menghubungkan ulang..."
-        time.sleep(2)
-        start_websocket()
-
-    def start_websocket():
-        ws = websocket.WebSocketApp(
-            WS_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-        )
-        state["ws_app"] = ws
-        threading.Thread(
-            target=lambda: ws.run_forever(ping_interval=20, ping_timeout=10),
-            daemon=True,
-        ).start()
-
-    start_websocket()
+    threading.Thread(target=fetch_oanda_data, daemon=True).start()
     return state
 
-
-system_state = init_system()
-
+system_state = init_oanda_system()
+# Update active API Key in state based on user input / secrets
+system_state["active_api_key"] = api_key 
 
 # ============================================================
-# PERHITUNGAN ZF (ZUHRI FORMALISM)
+# PERHITUNGAN ZF
 # ============================================================
 def calculate_zf(closes, volumes):
     if len(closes) < PERIOD_PPURE:
@@ -361,79 +157,78 @@ def calculate_zf(closes, volumes):
     volRatio = min(abs(vNow - vAvg) / vNow, 1.0) if vNow > 0 else 0.5
     zf = min(volRatio * math.tanh(dRes), 1.0)
 
-    if zf > 0.8:
-        return zf, dRes, "🔴 SHORT"
-    elif zf <= 0.45 and dRes < 0.4:
-        return zf, dRes, "🟢 BUY"
-    else:
-        return zf, dRes, "🟡 WAIT"
-
+    if zf > 0.8: return zf, dRes, "🔴 SHORT"
+    elif zf <= 0.45 and dRes < 0.4: return zf, dRes, "🟢 BUY"
+    else: return zf, dRes, "🟡 WAIT"
 
 # ============================================================
 # UI STREAMLIT DASHBOARD
 # ============================================================
-st.title("🤖 ZF-CORE V16.6 Omni Dashboard (WebSocket)")
+st.title("🤖 ZF-CORE V16.6 | OANDA (Forex & Gold)")
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("1H Candle", get_candle_countdown("1H"))
-col2.metric("4H Candle", get_candle_countdown("4H"))
-col3.metric("1D Candle", get_candle_countdown("1D"))
-col4.metric("1W Candle", get_candle_countdown("1W"))
+# Header Countdown
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("H1 Candle", get_candle_countdown("H1"))
+col2.metric("H4 Candle", get_candle_countdown("H4"))
+col3.metric("D1 Candle", get_candle_countdown("D"))
+col4.metric("W1 Candle", get_candle_countdown("W"))
+col5.metric("MN Candle", get_candle_countdown("M"))
 
 st.divider()
 
-table_data = []
+# ============================================================
+# TAMPILAN VERTIKAL PER PAIR (KARTU)
+# ============================================================
+# Setiap pair ditampilkan sebagai kartu tersendiri, dengan tiap
+# timeframe disusun ke bawah (bukan lagi tabel lebar/horizontal).
 with system_state["data_lock"]:
     for symbol in PAIRS:
-        display_name = symbol.replace("_", "/").upper()
-        is_usdt_pair = symbol.endswith("usdt")
+        # Menentukan trend harian (Daily Open vs Close)
+        trend_icon = "⚪"
+        s_d = system_state["candle_data"][symbol].get("D", {})
+        if "opens" in s_d and "closes" in s_d and len(s_d["opens"]) > 0:
+            trend_icon = "🟢" if s_d["closes"][-1] >= s_d["opens"][-1] else "🔴"
 
-        row = {"Pair": display_name}
+        # Mengambil harga terakhir dari H1
         current_price = 0.0
+        s_data_h1 = system_state["candle_data"][symbol].get("H1", {})
+        if "closes" in s_data_h1 and len(s_data_h1["closes"]) > 0:
+            current_price = s_data_h1["closes"][-1]
 
-        for tf in TIMEFRAMES:
-            dq = system_state["candle_data"][symbol][tf]
-            if dq:
-                current_price = dq[-1]["close"]
-                break
+        # Format harga (XAU lebih sedikit desimal dibanding Forex biasa)
+        price_str = f"${current_price:,.2f}" if "XAU" in symbol else f"{current_price:,.5f}"
+        if current_price == 0.0:
+            price_str = "-"
 
-        row["Price"] = f"${current_price:,.2f}" if is_usdt_pair else f"Rp {current_price:,.0f}"
+        with st.container(border=True):
+            head_col1, head_col2 = st.columns([3, 2])
+            head_col1.markdown(f"#### {symbol.replace('_', '/')} {trend_icon}")
+            head_col2.markdown(f"#### {price_str}")
 
-        for tf in TIMEFRAMES:
-            dq = system_state["candle_data"][symbol][tf]
-            if len(dq) >= PERIOD_PPURE:
-                closes = [c["close"] for c in dq]
-                volumes = [c["volume"] for c in dq]
-                zf, dRes, status = calculate_zf(closes, volumes)
-                row[tf] = f"{status} (ZF: {zf:.2f} | dR: {dRes:.1f}%)"
-            else:
-                row[tf] = f"Loading... ({len(dq)}/{PERIOD_PPURE})"
-        table_data.append(row)
+            for tf in TIMEFRAMES:
+                # Ubah label kolom agar lebih familiar (M -> MN, D -> D1)
+                tf_label = "MN" if tf == "M" else (tf + "1" if tf in ("D", "W") else tf)
 
-df = pd.DataFrame(table_data)
-st.dataframe(df, use_container_width=True, hide_index=True)
+                s_data = system_state["candle_data"][symbol].get(tf, {})
+                if "closes" in s_data and len(s_data["closes"]) >= PERIOD_PPURE:
+                    zf, dRes, status = calculate_zf(s_data["closes"], s_data["volumes"])
+                    line = f"**{tf_label}** &nbsp;→&nbsp; {status} &nbsp;|&nbsp; ZF: `{zf:.2f}` &nbsp;|&nbsp; dR: `{dRes:.1f}%`"
+                else:
+                    line = f"**{tf_label}** &nbsp;→&nbsp; Loading..."
 
-since_last = int(time.time() - system_state["last_update_time"])
-status_text = f"📡 Status: {system_state['connection_status']} | Terakhir update: {since_last} detik yang lalu"
-if since_last > STALE_THRESHOLD:
-    st.error(status_text + " (Koneksi bermasalah!)")
+                st.markdown(line, unsafe_allow_html=True)
+
+# Status Footer
+if system_state["last_success_time"] == 0:
+    st.info("🔄 Menunggu data pertama ditarik dari OANDA...")
 else:
-    st.success(status_text)
+    since_last = int(time.time() - system_state["last_success_time"])
+    status_text = f"📡 Status API: {system_state['api_status_msg']} | Terakhir update: {since_last} detik yang lalu"
+    if since_last > 30:
+        st.error(status_text + " (Data tertinggal, cek koneksi atau Limit API!)")
+    else:
+        st.success(status_text)
 
-with system_state["data_lock"]:
-    seed_ok = system_state["seed_ok_count"]
-    seed_total = system_state["seed_total"]
-    seed_errors = list(system_state["seed_errors"])
-
-if seed_ok < seed_total:
-    with st.expander(f"⚠️ Diagnostik seed historis: {seed_ok}/{seed_total} berhasil"):
-        if seed_errors:
-            for line in seed_errors[:15]:
-                st.text(line)
-            if len(seed_errors) > 15:
-                st.text(f"... dan {len(seed_errors) - 15} error lainnya")
-        else:
-            st.text("Belum ada data error tercatat (masih memuat?)")
-
-time.sleep(2)
+# Rerun loop
+time.sleep(3)
 st.rerun()
