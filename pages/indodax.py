@@ -1,10 +1,8 @@
 import streamlit as st
-import json
 import math
 import threading
 import time
 import requests
-import websocket
 import datetime
 import calendar
 import pandas as pd
@@ -12,12 +10,12 @@ import pandas as pd
 # ============================================================
 # KONFIGURASI 
 # ============================================================
-st.set_page_config(page_title="ZF-CORE Dashboard (Indodax WS)", layout="wide")
+st.set_page_config(page_title="ZF-CORE Omni Dashboard", layout="wide")
 
 PERIOD_PPURE = 20
 TIMEFRAMES = ["1H", "4H", "1D", "1W"]
 
-# Daftar pair disesuaikan dengan gambar Favorite Anda (format Indodax)
+# Daftar pair disesuaikan dengan gambar Favorite Anda (format Indodax/Triv)
 PAIRS = [
     "btc_idr", "eth_idr", "usdt_idr", "dot_idr",
     "btc_usdt", "xaut_idr", "usdc_idr", "sol_idr",
@@ -54,90 +52,52 @@ def get_candle_countdown(tf):
         return "N/A"
 
 # ============================================================
-# INISIALISASI & BACKGROUND TASKS
+# INISIALISASI & BACKGROUND POLLING TASKS (STABIL & ANTI-PUTUS)
 # ============================================================
 @st.cache_resource
 def init_system():
     state = {
         "candle_data": {symbol: {tf: {} for tf in TIMEFRAMES} for symbol in PAIRS},
-        "ws_status": "Menghubungkan...",
-        "last_message_time": time.time(),
+        "connection_status": "Online (Live Sync)",
+        "last_update_time": time.time(),
         "data_lock": threading.Lock()
     }
 
-    def fetch_initial_candles():
-        for symbol in PAIRS:
-            url = f"https://indodax.com/api/v2/ticker/{symbol}"
-            try:
-                res = requests.get(url, timeout=10).json()
-                if "ticker" in res:
-                    ticker = res["ticker"]
-                    last_p = float(ticker["last"])
-                    vol_p = float(ticker.get("vol_idr" if "idr" in symbol else "vol_usdt", 0))
-                    
-                    with state["data_lock"]:
-                        for tf in TIMEFRAMES:
-                            state["candle_data"][symbol][tf] = {
-                                "opens": [last_p] * PERIOD_PPURE,
-                                "closes": [last_p] * PERIOD_PPURE,
-                                "volumes": [max(vol_p / PERIOD_PPURE, 1.0)] * PERIOD_PPURE,
-                                "last_ts": int(time.time()),
-                            }
-            except Exception:
-                pass
-            time.sleep(0.05)
-
-    def on_message(ws, message):
-        if not message:
-            return
-        try:
-            data = json.loads(message)
-            if isinstance(data, dict):
-                market = data.get("market") or data.get("pair")
-                ticker_data = data.get("ticker", data)
-                
-                last_p = float(ticker_data.get("last", 0) or ticker_data.get("close", 0))
-                vol_p = float(ticker_data.get("vol", 0))
-                
-                if market in PAIRS and last_p > 0:
-                    with state["data_lock"]:
-                        for tf in TIMEFRAMES:
-                            s_data = state["candle_data"][market].get(tf, {})
-                            if "closes" in s_data and len(s_data["closes"]) > 0:
-                                s_data["closes"][-1] = last_p
-                                s_data["volumes"][-1] = vol_p
-                state["last_message_time"] = time.time()
-        except Exception:
-            pass
-
-    def on_error(ws, error): 
-        state["ws_status"] = f"Error: {error}"
-
-    def on_close(ws, code, msg): 
-        state["ws_status"] = "Terputus..."
-
-    def on_open(ws):
-        state["ws_status"] = "Online (Real-time)"
-        # Mengirimkan format subscribe yang valid untuk server Indodax
-        for symbol in PAIRS:
-            sub_msg = {
-                "event": "bts:subscribe",
-                "data": {
-                    "channel": f"{symbol}_ticker"
-                }
-            }
-            ws.send(json.dumps(sub_msg))
-
-    def run_ws():
+    def background_sync():
         while True:
-            ws = websocket.WebSocketApp("wss://indodax.com/ws/",
-                                        on_open=on_open, on_message=on_message,
-                                        on_error=on_error, on_close=on_close)
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-            time.sleep(3)
+            for symbol in PAIRS:
+                url = f"https://indodax.com/api/v2/ticker/{symbol}"
+                try:
+                    res = requests.get(url, timeout=5).json()
+                    if "ticker" in res:
+                        ticker = res["ticker"]
+                        last_p = float(ticker["last"])
+                        vol_p = float(ticker.get("vol_idr" if "idr" in symbol else "vol_usdt", 0))
+                        
+                        with state["data_lock"]:
+                            for tf in TIMEFRAMES:
+                                s_data = state["candle_data"][symbol].get(tf, {})
+                                if "closes" in s_data and len(s_data["closes"]) > 0:
+                                    # Update harga real-time pada candle terakhir
+                                    s_data["closes"][-1] = last_p
+                                    s_data["volumes"][-1] = vol_p
+                                else:
+                                    # Inisialisasi awal jika data kosong
+                                    state["candle_data"][symbol][tf] = {
+                                        "opens": [last_p] * PERIOD_PPURE,
+                                        "closes": [last_p] * PERIOD_PPURE,
+                                        "volumes": [max(vol_p / PERIOD_PPURE, 1.0)] * PERIOD_PPURE,
+                                        "last_ts": int(time.time()),
+                                    }
+                        state["last_update_time"] = time.time()
+                        state["connection_status"] = "Online (Live Sync)"
+                except Exception:
+                    state["connection_status"] = "Menghubungkan ulang..."
+                
+                time.sleep(0.2) # Jeda antar request agar tidak kena rate limit
+            time.sleep(3) # Jeda perulangan siklus market
 
-    fetch_initial_candles()
-    threading.Thread(target=run_ws, daemon=True).start()
+    threading.Thread(target=background_sync, daemon=True).start()
     return state
 
 system_state = init_system()
@@ -205,10 +165,10 @@ with system_state["data_lock"]:
 df = pd.DataFrame(table_data)
 st.dataframe(df, use_container_width=True, hide_index=True)
 
-since_last = int(time.time() - system_state["last_message_time"])
-status_text = f"📡 WebSocket: {system_state['ws_status']} | Terakhir update: {since_last} detik yang lalu"
+since_last = int(time.time() - system_state["last_update_time"])
+status_text = f"📡 Status: {system_state['connection_status']} | Terakhir update: {since_last} detik yang lalu"
 if since_last > 30:
-    st.error(status_text + " (Data mungkin tertinggal!)")
+    st.error(status_text + " (Koneksi bermasalah!)")
 else:
     st.success(status_text)
 
