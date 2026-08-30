@@ -155,7 +155,7 @@ setInterval(upd, 1000); upd();
 components.html(countdown_html, height=60)
 
 # Render Kartu Koin ala Telegram Bot dalam Grid Kolom Web
-cols = st.columns(2) # Membuat 2 kolom kartu agar rapi di layar HP/Desktop
+cols = st.columns(2)
 
 with data_lock:
     for idx, symbol in enumerate(PAIRS):
@@ -170,7 +170,6 @@ with data_lock:
         price_str = f"{current_price:,.2f}" if current_price >= 1 else f"{current_price:.6f}"
         if current_price == 0.0: price_str = "-"
         
-        # Tren harian untuk warna indikator harga
         trend_emoji = "⚪"
         s_1d = st.session_state.candle_data[symbol].get("1D", {})
         if "opens" in s_1d and "closes" in s_1d and len(s_1d["opens"]) > 0:
@@ -200,13 +199,11 @@ with data_lock:
                 """
         card_html += "</div>"
         
-        # Masukkan ke kolom bergantian (Kiri / Kanan)
         with cols[idx % 2]:
             st.markdown(card_html, unsafe_allow_html=True)
 
 if st.button("🔄 Refresh Data Manual"):
     st.rerun()
 
-# Auto-refresh halaman web setiap 15 detik untuk memperbarui harga pasar
 time.sleep(15)
 st.rerun()
