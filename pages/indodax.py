@@ -5,6 +5,7 @@ import time
 import json
 import datetime
 import collections
+import requests
 import pandas as pd
 import websocket  # pip install websocket-client
 
@@ -22,6 +23,14 @@ TIMEFRAME_SECONDS = {
 }
 TIMEFRAMES = list(TIMEFRAME_SECONDS.keys())
 
+# Indodax's /tradingview/history_v2 timeframe codes for each of our timeframes.
+TF_API_CODE = {
+    "1H": "60",
+    "4H": "240",
+    "1D": "1D",
+    "1W": "1W",
+}
+
 PAIRS = [
     "btc_idr", "eth_idr", "usdt_idr", "dot_idr",
     "btc_usdt", "xaut_idr", "usdc_idr", "sol_idr",
@@ -38,6 +47,9 @@ WS_STATIC_TOKEN = (
     "UR1lBM6Eqh0yWz-PVirw1uPCxe60FdchR8eNVdsskeo"
 )
 SUMMARY_CHANNEL = "market:summary-24h"
+
+# ---- Indodax OHLC history REST endpoint (used only to seed startup data) ----
+HISTORY_URL = "https://indodax.com/tradingview/history_v2"
 
 
 # ============================================================
@@ -78,11 +90,59 @@ def symbol_to_pair(symbol: str) -> str:
     return symbol.replace("_", "")
 
 
+def symbol_to_api_symbol(symbol: str) -> str:
+    """'btc_idr' -> 'BTCIDR' (Indodax /tradingview/history_v2 symbol format)."""
+    return symbol.replace("_", "").upper()
+
+
 PAIR_TO_SYMBOL = {symbol_to_pair(s): s for s in PAIRS}
 
 
+def fetch_history(symbol: str, tf: str, limit: int = PERIOD_PPURE):
+    """Fetch the last `limit` real OHLC candles for symbol/tf from Indodax's
+    official history endpoint, returned oldest -> newest as candle dicts."""
+    span = TIMEFRAME_SECONDS[tf]
+    now = int(time.time())
+    # Ask for a bit more than we need to absorb gaps / holes in the data.
+    from_ts = now - span * (limit + 5)
+
+    params = {
+        "symbol": symbol_to_api_symbol(symbol),
+        "tf": TF_API_CODE[tf],
+        "from": from_ts,
+        "to": now,
+    }
+    try:
+        resp = requests.get(HISTORY_URL, params=params, timeout=6)
+        data = resp.json()
+    except Exception:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    by_bucket = {}
+    for item in data:
+        try:
+            ts = bucket_start(float(item["Time"]), tf)
+            candle = {
+                "ts": ts,
+                "open": float(item["Open"]),
+                "high": float(item["High"]),
+                "low": float(item["Low"]),
+                "close": float(item["Close"]),
+                "volume": float(item["Volume"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        by_bucket[ts] = candle  # de-dupe by bucket, keep the latest entry
+
+    ordered = [by_bucket[k] for k in sorted(by_bucket.keys())]
+    return ordered[-limit:]
+
+
 # ============================================================
-# INISIALISASI & WEBSOCKET CLIENT (dengan rotasi candle nyata)
+# INISIALISASI: SEED HISTORIS + WEBSOCKET CLIENT
 # ============================================================
 @st.cache_resource
 def init_system():
@@ -92,12 +152,36 @@ def init_system():
             symbol: {tf: collections.deque(maxlen=PERIOD_PPURE) for tf in TIMEFRAMES}
             for symbol in PAIRS
         },
-        "connection_status": "Menghubungkan...",
+        "connection_status": "Memuat data historis...",
         "last_update_time": time.time(),
         "data_lock": threading.Lock(),
         "ws_app": None,
     }
 
+    # --------------------------------------------------------
+    # 1) Seed each symbol/timeframe with REAL historical candles
+    #    so the table doesn't need to wait hours/weeks for the
+    #    buffer to fill purely from live ticks.
+    # --------------------------------------------------------
+    def seed_historical():
+        for symbol in PAIRS:
+            for tf in TIMEFRAMES:
+                candles = fetch_history(symbol, tf, PERIOD_PPURE)
+                if candles:
+                    with state["data_lock"]:
+                        dq = state["candle_data"][symbol][tf]
+                        dq.clear()
+                        dq.extend(candles)
+        with state["data_lock"]:
+            state["connection_status"] = "Menghubungkan WebSocket..."
+
+    seed_historical()  # runs once, synchronously, before the page first renders
+
+    # --------------------------------------------------------
+    # 2) Live updates via WebSocket keep the last candle of each
+    #    timeframe moving, and roll a new candle whenever the
+    #    bucket changes — same logic as the historical seed uses.
+    # --------------------------------------------------------
     def apply_tick(symbol: str, price: float, volume: float):
         now = time.time()
         with state["data_lock"]:
@@ -124,10 +208,6 @@ def init_system():
             state["last_update_time"] = now
             state["connection_status"] = "Online (WebSocket Live)"
 
-    # --------------------------------------------------------
-    # Centrifugo-style protocol: connect -> authenticate (id 1)
-    # -> subscribe to market:summary-24h (id 2) -> stream updates
-    # --------------------------------------------------------
     def on_open(ws):
         auth_req = {"params": {"token": WS_STATIC_TOKEN}, "id": 1}
         ws.send(json.dumps(auth_req))
@@ -138,7 +218,6 @@ def init_system():
         except json.JSONDecodeError:
             return
 
-        # Response to our auth request -> now subscribe.
         if msg.get("id") == 1 and "result" in msg:
             sub_req = {
                 "method": 1,
@@ -148,7 +227,6 @@ def init_system():
             ws.send(json.dumps(sub_req))
             return
 
-        # Streaming market:summary-24h publications.
         result = msg.get("result", {})
         if result.get("channel") != SUMMARY_CHANNEL:
             return
@@ -164,7 +242,7 @@ def init_system():
 
             symbol = PAIR_TO_SYMBOL.get(pair)
             if symbol is None:
-                continue  # not one of our tracked pairs
+                continue
 
             try:
                 price = float(last_price)
@@ -182,7 +260,7 @@ def init_system():
         with state["data_lock"]:
             state["connection_status"] = "Terputus, menghubungkan ulang..."
         time.sleep(2)
-        start_websocket()  # reconnect
+        start_websocket()
 
     def start_websocket():
         ws = websocket.WebSocketApp(
