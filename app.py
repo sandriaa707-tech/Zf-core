@@ -22,23 +22,6 @@ st.markdown("""
     <style>
     .main { background-color: #0e1117; color: #c9d1d9; font-family: 'Courier New', Courier, monospace; }
     h1, h2, h3 { color: #58a6ff; font-family: 'Courier New', Courier, monospace; }
-    .card {
-        background: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 10px;
-        padding: 15px;
-        margin-bottom: 15px;
-    }
-    .card-title {
-        font-size: 18px;
-        font-weight: bold;
-        color: #f0883e;
-        margin-bottom: 8px;
-    }
-    .tf-row {
-        font-size: 14px;
-        margin: 4px 0;
-    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -125,7 +108,7 @@ def calculate_zf(closes, volumes):
 st.title("🤖 ZF-CORE V16.6 | OMNI WEB TERMINAL")
 st.markdown("Command Center Deterministic Protocol — Multi-Timeframe Analysis (1H, 1D, 1W, 1M).")
 
-# Live Countdown Widget via JS (1 Detik Halus)
+# Live Countdown Widget via JS
 countdown_html = f"""
 <div style="display: flex; gap: 10px; justify-content: space-between; background: #161b22; padding: 12px; border-radius: 8px; border: 1px solid #30363d; font-family: monospace; color: #c9d1d9; margin-bottom: 20px;">
     <div>⏱️ <b>1H:</b> <span id="cd-1h">--</span></div>
@@ -154,7 +137,7 @@ setInterval(upd, 1000); upd();
 """
 components.html(countdown_html, height=60)
 
-# Render Kartu Koin ala Telegram Bot dalam Grid Kolom Web
+# Render Kartu Koin Menggunakan Container Streamlit
 cols = st.columns(2)
 
 with data_lock:
@@ -175,32 +158,19 @@ with data_lock:
         if "opens" in s_1d and "closes" in s_1d and len(s_1d["opens"]) > 0:
             trend_emoji = "🟢" if s_1d["closes"][-1] >= s_1d["opens"][-1] else "🔴"
 
-        card_html = f"""
-        <div class="card">
-            <div class="card-title">⚡ [ {display_sym} ] — ${price_str} {trend_emoji}</div>
-        """
-        
-        tf_icons = {"1H": "⏱️", "1D": "📅", "1W": "📊", "1M": "🗓️"}
-        
-        for tf in TIMEFRAMES:
-            s_data = st.session_state.candle_data[symbol].get(tf, {})
-            if "closes" in s_data and len(s_data["closes"]) > 0:
-                zf, dRes, status_text, color = calculate_zf(s_data["closes"], s_data["volumes"])
-                card_html += f"""
-                <div class="tf-row" style="color: {color};">
-                    &nbsp;&nbsp;<b>{tf_icons.get(tf, '🔹')} {tf}</b> : {zf:4.2f} [{status_text}] (dR: {dRes:4.1f}%)
-                </div>
-                """
-            else:
-                card_html += f"""
-                <div class="tf-row" style="color: #8b949e;">
-                    &nbsp;&nbsp;<b>{tf_icons.get(tf, '🔹')} {tf}</b> : Loading...
-                </div>
-                """
-        card_html += "</div>"
-        
         with cols[idx % 2]:
-            st.markdown(card_html, unsafe_allow_html=True)
+            with st.container(border=True):
+                st.markdown(f"<div style='font-size: 16px; font-weight: bold; color: #f0883e; margin-bottom: 8px;'>⚡ [ {display_sym} ] — ${price_str} {trend_emoji}</div>", unsafe_allow_html=True)
+                
+                tf_icons = {"1H": "⏱️", "1D": "📅", "1W": "📊", "1M": "🗓️"}
+                
+                for tf in TIMEFRAMES:
+                    s_data = st.session_state.candle_data[symbol].get(tf, {})
+                    if "closes" in s_data and len(s_data["closes"]) > 0:
+                        zf, dRes, status_text, color = calculate_zf(s_data["closes"], s_data["volumes"])
+                        st.markdown(f"<div style='font-family: monospace; font-size: 14px; color: {color}; margin: 4px 0;'>&nbsp;&nbsp;<b>{tf_icons.get(tf, '🔹')} {tf}</b> : {zf:4.2f} [{status_text}] (dR: {dRes:4.1f}%)</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div style='font-family: monospace; font-size: 14px; color: #8b949e; margin: 4px 0;'>&nbsp;&nbsp;<b>{tf_icons.get(tf, '🔹')} {tf}</b> : Loading...</div>", unsafe_allow_html=True)
 
 if st.button("🔄 Refresh Data Manual"):
     st.rerun()
