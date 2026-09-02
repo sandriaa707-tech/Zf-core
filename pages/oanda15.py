@@ -25,7 +25,7 @@ API_KEY = "49ffdf53849b61ca10ae1390654cd00c-3d998c4d1ef821a794b75b868861eae8"
 ACCOUNT_ID = "101-011-17416884-001"
 
 OANDA_URL = "https://api-fxpractice.oanda.com/v3"
-PERIOD_P_PURE = 25
+PERIOD_P_PURE = 20
 TIMEFRAMES = ["H1", "H4", "D", "W", "M"]
 
 SYMBOLS = [
