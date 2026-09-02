@@ -1,9 +1,9 @@
 import streamlit as st
 import requests
 import math
-import time
 import datetime
 from concurrent.futures import ThreadPoolExecutor
+from streamlit_autorefresh import st_autorefresh
 
 # ============================================================
 # KONFIGURASI HALAMAN STREAMLIT
@@ -15,6 +15,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Auto-refresh halaman setiap 60 detik (60000 milidetik)
+st_autorefresh(interval=60000, key="oanda_autorefresh")
+
 # ============================================================
 # KONFIGURASI OANDA API
 # ============================================================
@@ -22,7 +25,7 @@ API_KEY = "49ffdf53849b61ca10ae1390654cd00c-3d998c4d1ef821a794b75b868861eae8"
 ACCOUNT_ID = "101-011-17416884-001"
 
 OANDA_URL = "https://api-fxpractice.oanda.com/v3"
-PERIOD_P_PURE = 25
+PERIOD_P_PURE = 20
 TIMEFRAMES = ["H1", "H4", "D", "W", "M"]
 
 SYMBOLS = [
@@ -33,6 +36,28 @@ SYMBOLS = [
     # Commodities & Crypto
     "XAU_USD", "XAG_USD", "BTC_USD"
 ]
+
+# ============================================================
+# FUNGSI COUNTDOWN TIMER
+# ============================================================
+def get_countdowns():
+    now = datetime.datetime.now()
+    h1_m, h1_s = 59 - now.minute, 59 - now.second
+    h4_h = 3 - (now.hour % 4)
+    d1_h = 23 - now.hour
+
+    w1_d = 4 - now.weekday() if now.weekday() <= 4 else 0
+    import calendar
+    _, last_day = calendar.monthrange(now.year, now.month)
+    mn_d = last_day - now.day
+
+    return (
+        f"H1: {h1_m:02d}m {h1_s:02d}s",
+        f"H4: {h4_h}h {h1_m:02d}m",
+        f"D1: {d1_h}h {h1_m:02d}m",
+        f"W1: {w1_d}d {d1_h}h",
+        f"MN: {mn_d}d {d1_h}h"
+    )
 
 # ============================================================
 # FUNGSI PERHITUNGAN & API
@@ -92,55 +117,16 @@ def fetch_pair_data(sym):
 # TAMPILAN UTAMA STREAMLIT
 # ============================================================
 st.title("⚡ ZUHRI FORMALISM V16.6")
-st.markdown("**Oanda Deterministik Feed Dashboard (Real-time Timer)**")
+st.markdown("**Oanda Deterministik Feed Dashboard (Auto-Update 60s)**")
 
-# Sidebar untuk Countdown Timer Real-time menggunakan JavaScript Widget
+# Sidebar untuk Informasi Waktu & Kontrol
 st.sidebar.header("🕒 Countdown Timer")
-
-timer_placeholder = st.sidebar.empty()
-
-# Skrip JavaScript untuk menjalankan countdown setiap 1 detik secara live di browser
-timer_html = """
-<div id="live-timer" style="font-size: 14px; font-family: monospace; color: #31333F;">Menghitung waktu...</div>
-<script>
-function updateTimer() {
-    const now = new Date();
-    
-    // H1 Countdown
-    const h1_m = 59 - now.getMinutes();
-    const h1_s = 59 - now.getSeconds();
-    
-    // H4 Countdown
-    const h4_h = 3 - (now.getHours() % 4);
-    
-    // D1 Countdown
-    const d1_h = 23 - now.getHours();
-    const d1_m = 59 - now.getMinutes();
-    
-    // W1 Countdown (Hari kerja sampai Jumat)
-    let dayOfWeek = now.getDay(); // 0 = Minggu, 5 = Jumat
-    let w1_d = (dayOfWeek >= 1 && dayOfWeek <= 5) ? (5 - dayOfWeek) : 0;
-    
-    // MN Countdown (Akhir bulan)
-    let year = now.getFullYear();
-    let month = now.getMonth();
-    let lastDay = new Date(year, month + 1, 0).getDate();
-    let mn_d = lastDay - now.getDate();
-
-    let text = "<b>H1:</b> " + String(h1_m).padStart(2, '0') + "m " + String(h1_s).padStart(2, '0') + "s<br>" +
-               "<b>H4:</b> " + h4_h + "h " + String(h1_m).padStart(2, '0') + "m<br>" +
-               "<b>D1:</b> " + d1_h + "h " + String(h1_m).padStart(2, '0') + "m<br>" +
-               "<b>W1:</b> " + w1_d + "d " + d1_h + "h<br>" +
-               "<b>MN:</b> " + mn_d + "d " + d1_h + "h";
-               
-    document.getElementById("live-timer").innerHTML = text;
-}
-setInterval(updateTimer, 1000);
-updateTimer();
-</script>
-"""
-import streamlit.components.v1 as components
-components.html(timer_html, height=120)
+t_h1, t_h4, t_d1, t_w1, t_mn = get_countdowns()
+st.sidebar.write(f"- {t_h1}")
+st.sidebar.write(f"- {t_h4}")
+st.sidebar.write(f"- {t_d1}")
+st.sidebar.write(f"- {t_w1}")
+st.sidebar.write(f"- {t_mn}")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("💡 **Keterangan Sinyal:**")
@@ -151,8 +137,7 @@ st.sidebar.markdown("🟡 **[WAIT]** (Kuning)")
 if st.sidebar.button("🔄 Refresh Data Sekarang"):
     st.rerun()
 
-# Mengambil Data dari OANDA (Cache diperbarui tiap 60 detik agar tidak terkena limit API)
-@st.cache_data(ttl=60)
+# Mengambil Data Menggunakan ThreadPool (Tanpa Cache agar data ter-update otomatis)
 def load_all_data():
     temp_results, temp_info = {}, {}
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -163,13 +148,13 @@ def load_all_data():
             temp_info[sym] = {'price': d_price, 'open': d_open}
     return temp_results, temp_info
 
-with st.spinner("Sedang menarik data dari OANDA API..."):
+with st.spinner("Sedang menarik data terbaru dari OANDA API..."):
     all_results, pair_info = load_all_data()
 
 last_update_str = datetime.datetime.now().strftime("%H:%M:%S")
-st.caption(f"Terakhir diperbarui: {last_update_str}")
+st.caption(f"Terakhir diperbarui secara otomatis: {last_update_str}")
 
-# Layout Grid untuk Setiap Pair
+# Layout Grid / Cards untuk Setiap Pair
 cols_per_row = 3
 symbol_chunks = [SYMBOLS[i:i + cols_per_row] for i in range(0, len(SYMBOLS), cols_per_row)]
 
@@ -183,6 +168,7 @@ for chunk in symbol_chunks:
 
             trend_icon = "🟢" if info['price'] >= info['open'] else "🔴"
             
+            # Format Harga
             if "BTC" in sym:
                 formatted_price = f"{info['price']:,.0f}"
             elif "JPY" in sym or "XAG" in sym:
@@ -192,6 +178,7 @@ for chunk in symbol_chunks:
             else:
                 formatted_price = f"{info['price']:,.4f}"
 
+            # Container / Card untuk tiap pair
             with st.container(border=True):
                 st.markdown(f"### ⚡ {display_sym} &nbsp; {trend_icon}")
                 st.markdown(f"**Harga:** `{formatted_price}`")
