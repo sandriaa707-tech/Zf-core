@@ -150,6 +150,58 @@ def format_price(symbol, price):
 
 
 # ============================================================
+# CANDLE CLOSE TIMES — berbasis jam device (perkiraan, bukan jam resmi broker)
+# ============================================================
+def _fmt_delta(delta):
+    total_min = int(delta.total_seconds() // 60)
+    d, rem = divmod(total_min, 1440)
+    h, m = divmod(rem, 60)
+    if d > 0:
+        return f"{d}h {h}j"
+    if h > 0:
+        return f"{h}j {m}m"
+    return f"{m}m"
+
+
+def get_candle_close_info():
+    now = datetime.datetime.now()
+
+    h1_close = (now.replace(minute=0, second=0, microsecond=0)
+                + datetime.timedelta(hours=1))
+
+    h4_block_start = (now.hour // 4) * 4
+    h4_close = (now.replace(hour=0, minute=0, second=0, microsecond=0)
+                + datetime.timedelta(hours=h4_block_start + 4))
+
+    d1_close = (now.replace(hour=0, minute=0, second=0, microsecond=0)
+                + datetime.timedelta(days=1))
+
+    days_to_monday = (7 - now.weekday()) % 7
+    if days_to_monday == 0:
+        days_to_monday = 7
+    w1_close = (now.replace(hour=0, minute=0, second=0, microsecond=0)
+                + datetime.timedelta(days=days_to_monday))
+
+    if now.month == 12:
+        mn_close = now.replace(year=now.year + 1, month=1, day=1,
+                                hour=0, minute=0, second=0, microsecond=0)
+    else:
+        mn_close = now.replace(month=now.month + 1, day=1,
+                                hour=0, minute=0, second=0, microsecond=0)
+
+    entries = [
+        ("H1", h1_close), ("H4", h4_close), ("D1", d1_close),
+        ("W1", w1_close), ("MN", mn_close),
+    ]
+    return [
+        f"{label} tutup {close.strftime('%H:%M')}"
+        + (f" ({close.strftime('%d/%m')})" if close.date() != now.date() else "")
+        + f" · {_fmt_delta(close - now)} lagi"
+        for label, close in entries
+    ]
+
+
+# ============================================================
 # STYLING
 # ============================================================
 def style_status(val):
@@ -170,7 +222,7 @@ def style_price(val):
 
 # ============================================================
 # BACKGROUND DATA STORE — 1 thread, jalan terus, fetch paralel,
-# selaras ke detik ke-00 tiap menit (sama seperti script terminal asli)
+# selaras ke detik ke-00 tiap menit
 # ============================================================
 class DataStore:
     def __init__(self, api_key, base_url):
@@ -271,6 +323,10 @@ def main():
     update_str = last_update.strftime("%H:%M:%S") if last_update else "-"
     st.caption(f"{datetime.datetime.now().strftime('%H:%M:%S')}  ·  update terakhir: {update_str} {status_txt}  "
                f"·  refresh tiap pergantian menit")
+
+    close_info = get_candle_close_info()
+    st.caption("  ·  ".join(close_info))
+    st.caption("⏱️ Waktu tutup candle mengikuti jam device, bukan jam resmi broker (OANDA biasanya pakai zona New York untuk D1/W1).")
 
     if not all_results:
         st.info("Mengambil data pertama kali (butuh sampai ~1 menit untuk 32 pasangan)...")
