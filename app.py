@@ -19,7 +19,7 @@ except ImportError:
 # ============================================================
 st.set_page_config(page_title="ZF-CORE", layout="wide", page_icon="📈")
 
-PERIOD_P_PURE = 20
+PERIOD_P_PURE = 25
 TIMEFRAMES = ["H1", "H4", "D", "W", "M"]
 TF_LABELS = {"H1": "H1", "H4": "H4", "D": "D1", "W": "W1", "M": "MN"}
 MAX_WORKERS = 8
@@ -149,12 +149,23 @@ def format_price(symbol, price):
     return f"{price:.4f}"
 
 
+# ============================================================
+# STYLING
+# ============================================================
 def style_status(val):
     if val == "BUY":
         return "background-color:#1a7a3c;color:white;font-weight:bold;text-align:center"
     if val == "SELL":
         return "background-color:#c0392b;color:white;font-weight:bold;text-align:center"
     return "background-color:#d4ac0d;color:black;font-weight:bold;text-align:center"
+
+
+def style_price(val):
+    if "▲" in val:
+        return "color:#1a7a3c;font-weight:bold"
+    if "▼" in val:
+        return "color:#c0392b;font-weight:bold"
+    return ""
 
 
 # ============================================================
@@ -212,7 +223,6 @@ class DataStore:
                     self.errors = [f"Fatal: {e}"]
                     self.fetching = False
 
-            # Tidur sampai tepat detik ke-00 menit berikutnya (selaras jam)
             now = datetime.datetime.now()
             sleep_s = 60 - now.second - now.microsecond / 1_000_000
             if sleep_s <= 0:
@@ -250,11 +260,8 @@ def main():
 
     store = get_data_store(api_key, base_url)
 
-    # Autorefresh HALAMAN, bukan fetch — dipicu tepat di detik ke-00 tiap menit
     if HAS_AUTOREFRESH:
         wait_ms = seconds_to_next_minute() * 1000
-        # saat pertama kali render belum ada data, refresh lebih sering (2 dtk)
-        # sampai data pertama siap, setelahnya selaras ke menit
         interval = 2000 if store.last_update is None else wait_ms
         st_autorefresh(interval=interval, key="zfcore_refresh")
 
@@ -305,7 +312,11 @@ def main():
 
     df = pd.DataFrame(rows).set_index("PAIR")
     status_cols = list(TF_LABELS.values())
-    styled = df.style.applymap(style_status, subset=status_cols)
+    styled = (
+        df.style
+        .applymap(style_status, subset=status_cols)
+        .applymap(style_price, subset=["HARGA"])
+    )
     st.dataframe(styled, use_container_width=True, height=len(rows) * 36 + 40)
 
     if errors:
