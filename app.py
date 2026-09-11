@@ -1,10 +1,12 @@
 import math
 import datetime
-import calendar
+import threading
+import time
 
 import requests
 import pandas as pd
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -20,6 +22,7 @@ st.set_page_config(page_title="ZF-CORE", layout="wide", page_icon="📈")
 PERIOD_P_PURE = 20
 TIMEFRAMES = ["H1", "H4", "D", "W", "M"]
 TF_LABELS = {"H1": "H1", "H4": "H4", "D": "D1", "W": "W1", "M": "MN"}
+MAX_WORKERS = 8
 
 SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD", "USD_CHF",
@@ -30,18 +33,14 @@ SYMBOLS = [
     "BTC_USD", "ETH_USD", "LTC_USD", "BCH_USD",
 ]
 
-FETCH_TTL_SECONDS = 60   # match OANDA fetch cycle from the original script
-UI_REFRESH_MS = 2000     # redraw every 2s like the original terminal loop
-
 
 # ============================================================
 # SECRETS / API KEY
 # ============================================================
 def get_credentials():
-    """Read from st.secrets first (Streamlit Cloud), fall back to sidebar input."""
     api_key = st.secrets.get("OANDA_API_KEY", "")
     account_id = st.secrets.get("OANDA_ACCOUNT_ID", "")
-    env = st.secrets.get("OANDA_ENV", "practice")  # "practice" or "live"
+    env = st.secrets.get("OANDA_ENV", "practice")
 
     with st.sidebar:
         st.header("⚙️ OANDA Connection")
@@ -57,9 +56,8 @@ def get_credentials():
 
 
 # ============================================================
-# DATA FETCH (cached — hits OANDA at most once per FETCH_TTL_SECONDS)
+# FETCH (dipanggil HANYA dari thread background, bukan dari render)
 # ============================================================
-@st.cache_data(ttl=FETCH_TTL_SECONDS, show_spinner=False)
 def get_candles(symbol, granularity, api_key, base_url):
     headers = {"Authorization": f"Bearer {api_key}", "Accept-Datetime-Format": "UNIX"}
     url = f"{base_url}/instruments/{symbol}/candles"
@@ -151,26 +149,90 @@ def format_price(symbol, price):
     return f"{price:.4f}"
 
 
-def get_countdowns():
-    now = datetime.datetime.now()
-    h1_m = 59 - now.minute
-    h4_h = 3 - (now.hour % 4)
-    d1_h = 23 - now.hour
-    w1_d = 4 - now.weekday() if now.weekday() <= 4 else 0
-    _, last_day = calendar.monthrange(now.year, now.month)
-    mn_d = last_day - now.day
-    return f"H1: {h1_m:02d}m", f"H4: {h4_h}h", f"D1: {d1_h}h", f"W1: {w1_d}d", f"MN: {mn_d}d"
-
-
-# ============================================================
-# STYLING
-# ============================================================
 def style_status(val):
     if val == "BUY":
         return "background-color:#1a7a3c;color:white;font-weight:bold;text-align:center"
     if val == "SELL":
         return "background-color:#c0392b;color:white;font-weight:bold;text-align:center"
     return "background-color:#d4ac0d;color:black;font-weight:bold;text-align:center"
+
+
+# ============================================================
+# BACKGROUND DATA STORE — 1 thread, jalan terus, fetch paralel,
+# selaras ke detik ke-00 tiap menit (sama seperti script terminal asli)
+# ============================================================
+class DataStore:
+    def __init__(self, api_key, base_url):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.lock = threading.Lock()
+        self.results = {}
+        self.pair_info = {}
+        self.last_update = None
+        self.errors = []
+        self.fetching = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _fetch_all(self):
+        temp_results, temp_info, errors = {}, {}, []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(fetch_pair_data, sym, self.api_key, self.base_url): sym
+                for sym in SYMBOLS
+            }
+            for future in futures:
+                sym = futures[future]
+                try:
+                    tf_results, d_price, d_open, err = future.result()
+                except Exception as e:
+                    errors.append(f"{sym}: {e}")
+                    continue
+                temp_results[sym] = tf_results
+                temp_info[sym] = {"price": d_price, "open": d_open}
+                if err:
+                    errors.append(err)
+
+        with self.lock:
+            if temp_results:
+                self.results = temp_results
+                self.pair_info = temp_info
+            self.last_update = datetime.datetime.now()
+            self.errors = errors
+            self.fetching = False
+
+    def _run(self):
+        while True:
+            try:
+                with self.lock:
+                    self.fetching = True
+                self._fetch_all()
+            except Exception as e:
+                with self.lock:
+                    self.errors = [f"Fatal: {e}"]
+                    self.fetching = False
+
+            # Tidur sampai tepat detik ke-00 menit berikutnya (selaras jam)
+            now = datetime.datetime.now()
+            sleep_s = 60 - now.second - now.microsecond / 1_000_000
+            if sleep_s <= 0:
+                sleep_s += 60
+            time.sleep(sleep_s)
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.results), dict(self.pair_info), self.last_update, list(self.errors), self.fetching
+
+
+@st.cache_resource
+def get_data_store(api_key, base_url):
+    return DataStore(api_key, base_url)
+
+
+def seconds_to_next_minute():
+    now = datetime.datetime.now()
+    s = 60 - now.second
+    return s if s > 0 else 60
 
 
 # ============================================================
@@ -183,28 +245,38 @@ def main():
     base_url = "https://api-fxpractice.oanda.com/v3" if env == "practice" else "https://api-fxtrade.oanda.com/v3"
 
     if not api_key:
-        st.info("Enter your OANDA API key in the sidebar (or set OANDA_API_KEY in `.streamlit/secrets.toml`) to start.")
+        st.info("Enter your OANDA API key in the sidebar (or set OANDA_API_KEY in secrets) to start.")
         st.stop()
 
-    if HAS_AUTOREFRESH:
-        st_autorefresh(interval=UI_REFRESH_MS, key="zfcore_refresh")
-    else:
-        st.caption("Install `streamlit-autorefresh` for automatic refresh (see requirements.txt).")
+    store = get_data_store(api_key, base_url)
 
-    h1, h4, d1, w1, mn = get_countdowns()
-    st.caption(f"{datetime.datetime.now().strftime('%H:%M:%S')}  ·  {h1}  {h4}  {d1}  {w1}  {mn}  "
-               f"·  data refreshes every {FETCH_TTL_SECONDS}s")
+    # Autorefresh HALAMAN, bukan fetch — dipicu tepat di detik ke-00 tiap menit
+    if HAS_AUTOREFRESH:
+        wait_ms = seconds_to_next_minute() * 1000
+        # saat pertama kali render belum ada data, refresh lebih sering (2 dtk)
+        # sampai data pertama siap, setelahnya selaras ke menit
+        interval = 2000 if store.last_update is None else wait_ms
+        st_autorefresh(interval=interval, key="zfcore_refresh")
+
+    all_results, pair_info, last_update, errors, fetching = store.snapshot()
+
+    status_txt = "🔄 memperbarui..." if fetching else "✅ siap"
+    update_str = last_update.strftime("%H:%M:%S") if last_update else "-"
+    st.caption(f"{datetime.datetime.now().strftime('%H:%M:%S')}  ·  update terakhir: {update_str} {status_txt}  "
+               f"·  refresh tiap pergantian menit")
+
+    if not all_results:
+        st.info("Mengambil data pertama kali (butuh sampai ~1 menit untuk 32 pasangan)...")
+        return
 
     rows = []
-    errors = []
     full_buy, full_sell = [], []
 
-    progress = st.empty()
-    for i, sym in enumerate(SYMBOLS):
-        progress.progress((i + 1) / len(SYMBOLS), text=f"Fetching {sym}...")
-        tf_results, d_price, d_open, err = fetch_pair_data(sym, api_key, base_url)
-        if err:
-            errors.append(err)
+    for sym in SYMBOLS:
+        tf_results = all_results.get(sym)
+        if not tf_results:
+            continue
+        info = pair_info.get(sym, {"price": 0, "open": 0})
 
         display_sym = sym.replace("_", "")
         if display_sym == "XAUUSD":
@@ -218,15 +290,11 @@ def main():
         elif alignment == "SELL":
             full_sell.append(display_sym)
 
-        arrow = "▲" if d_price >= d_open else "▼"
-        row = {
-            "PAIR": display_sym,
-            "HARGA": f"{format_price(sym, d_price)} {arrow}",
-        }
+        arrow = "▲" if info["price"] >= info["open"] else "▼"
+        row = {"PAIR": display_sym, "HARGA": f"{format_price(sym, info['price'])} {arrow}"}
         for label in TF_LABELS.values():
             row[label] = tf_results[label]["status"]
         rows.append(row)
-    progress.empty()
 
     if full_buy or full_sell:
         cols = st.columns(2)
