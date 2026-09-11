@@ -150,19 +150,8 @@ def format_price(symbol, price):
 
 
 # ============================================================
-# CANDLE CLOSE TIMES — berbasis jam device (perkiraan, bukan jam resmi broker)
+# CANDLE CLOSE COUNTDOWN — berbasis jam device
 # ============================================================
-def _fmt_delta(delta):
-    total_min = int(delta.total_seconds() // 60)
-    d, rem = divmod(total_min, 1440)
-    h, m = divmod(rem, 60)
-    if d > 0:
-        return f"{d}h {h}j"
-    if h > 0:
-        return f"{h}j {m}m"
-    return f"{m}m"
-
-
 def get_candle_close_info():
     now = datetime.datetime.now()
 
@@ -189,16 +178,20 @@ def get_candle_close_info():
         mn_close = now.replace(month=now.month + 1, day=1,
                                 hour=0, minute=0, second=0, microsecond=0)
 
-    entries = [
-        ("H1", h1_close), ("H4", h4_close), ("D1", d1_close),
-        ("W1", w1_close), ("MN", mn_close),
-    ]
-    return [
-        f"{label} tutup {close.strftime('%H:%M')}"
-        + (f" ({close.strftime('%d/%m')})" if close.date() != now.date() else "")
-        + f" · {_fmt_delta(close - now)} lagi"
-        for label, close in entries
-    ]
+    def fmt(label, close):
+        total_min = int((close - now).total_seconds() // 60)
+        d, rem = divmod(total_min, 1440)
+        h, m = divmod(rem, 60)
+        if d > 0:
+            return f"{label}:{d}d"
+        if h > 0:
+            return f"{label}:{h}h"
+        return f"{label}:{m:02d}m"
+
+    return " ".join([
+        fmt("H1", h1_close), fmt("H4", h4_close), fmt("D1", d1_close),
+        fmt("W1", w1_close), fmt("MN", mn_close),
+    ])
 
 
 # ============================================================
@@ -324,9 +317,7 @@ def main():
     st.caption(f"{datetime.datetime.now().strftime('%H:%M:%S')}  ·  update terakhir: {update_str} {status_txt}  "
                f"·  refresh tiap pergantian menit")
 
-    close_info = get_candle_close_info()
-    st.caption("  ·  ".join(close_info))
-    st.caption("⏱️ Waktu tutup candle mengikuti jam device, bukan jam resmi broker (OANDA biasanya pakai zona New York untuk D1/W1).")
+    st.caption(get_candle_close_info())
 
     if not all_results:
         st.info("Mengambil data pertama kali (butuh sampai ~1 menit untuk 32 pasangan)...")
