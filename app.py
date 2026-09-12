@@ -103,25 +103,38 @@ def oanda_get_credentials():
     return api_key, account_id, env
 
 
-def oanda_get_candles(symbol, granularity, api_key, base_url):
+def oanda_get_candles(symbol, granularity, api_key, base_url, max_retries=3):
     headers = {"Authorization": f"Bearer {api_key}", "Accept-Datetime-Format": "UNIX"}
     url = f"{base_url}/instruments/{symbol}/candles"
     params = {"count": OANDA_PERIOD, "price": "M", "granularity": granularity}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=10)
-        if r.status_code == 200:
-            return r.json().get("candles"), None
+
+    last_err = None
+    for attempt in range(max_retries + 1):
         try:
-            err = r.json().get("errorMessage", r.text)
-        except ValueError:
-            err = r.text
-        return None, f"HTTP {r.status_code} [{symbol} {granularity}]: {err[:120]}"
-    except requests.exceptions.Timeout:
-        return None, f"Timeout [{symbol} {granularity}]"
-    except requests.exceptions.ConnectionError:
-        return None, f"Koneksi gagal [{symbol} {granularity}]"
-    except Exception as e:
-        return None, f"Error [{symbol} {granularity}]: {e}"
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            if r.status_code == 200:
+                return r.json().get("candles"), None
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                retry_after = r.headers.get("Retry-After")
+                wait_s = float(retry_after) if retry_after else 1.5 * (attempt + 1)
+                time.sleep(wait_s)
+                last_err = f"HTTP {r.status_code} [{symbol} {granularity}], retry {attempt+1}/{max_retries}"
+                continue
+            try:
+                err = r.json().get("errorMessage", r.text)
+            except ValueError:
+                err = r.text
+            return None, f"HTTP {r.status_code} [{symbol} {granularity}]: {err[:120]}"
+        except requests.exceptions.Timeout:
+            last_err = f"Timeout [{symbol} {granularity}]"
+        except requests.exceptions.ConnectionError:
+            last_err = f"Koneksi gagal [{symbol} {granularity}]"
+        except Exception as e:
+            last_err = f"Error [{symbol} {granularity}]: {e}"
+        if attempt < max_retries:
+            time.sleep(1.5 * (attempt + 1))
+
+    return None, last_err or f"Gagal setelah {max_retries} percobaan [{symbol} {granularity}]"
 
 
 def oanda_calc_sma(values):
@@ -347,11 +360,19 @@ OKX_SYMBOLS = [
 ]
 
 
-def okx_fetch_history(inst_id, tf, limit=OKX_PERIOD + 1):
+def okx_fetch_history(inst_id, tf, limit=OKX_PERIOD + 1, max_retries=3):
     url = f"{OKX_REST_BASE}/api/v5/market/candles"
     params = {"instId": inst_id, "bar": OKX_BAR_MAP[tf], "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
+
+    r = None
+    for attempt in range(max_retries + 1):
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 429 and attempt < max_retries:
+            time.sleep(1.0 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        break
+
     data = r.json().get("data", [])
     data.reverse()
     candles = []
@@ -427,6 +448,7 @@ class OkxLiveStore:
             new_buf[sym] = {}
             new_result[sym] = {}
             for tf in OKX_TIMEFRAMES:
+                time.sleep(0.15)  # cegah burst >20 request/2 detik ke OKX
                 try:
                     candles = okx_fetch_history(sym, tf)
                 except Exception:
